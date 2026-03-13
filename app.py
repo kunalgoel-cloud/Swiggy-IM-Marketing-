@@ -230,15 +230,25 @@ class HistoryManager:
         }
         
         for upload in uploads:
-            m = upload['metrics']['granular']
-            trend_data['dates'].append(upload['timestamp'][:10])
-            trend_data['labels'].append(upload['user_label'])
-            trend_data['spend'].append(m['total_spend'])
-            trend_data['gmv'].append(m['total_gmv'])
-            trend_data['roi'].append(m['avg_roi'])
-            trend_data['conversions'].append(m['total_conversions'])
-            trend_data['ctr'].append(m['avg_ctr'] * 100)
-            trend_data['cost_per_conv'].append(m['cost_per_conversion'])
+            # Safely access metrics
+            try:
+                if 'granular' in upload['metrics']:
+                    m = upload['metrics']['granular']
+                else:
+                    # Old format - metrics directly
+                    m = upload['metrics']
+                
+                trend_data['dates'].append(upload['timestamp'][:10])
+                trend_data['labels'].append(upload['user_label'])
+                trend_data['spend'].append(m.get('total_spend', 0))
+                trend_data['gmv'].append(m.get('total_gmv', 0))
+                trend_data['roi'].append(m.get('avg_roi', 0))
+                trend_data['conversions'].append(m.get('total_conversions', 0))
+                trend_data['ctr'].append(m.get('avg_ctr', 0) * 100)
+                trend_data['cost_per_conv'].append(m.get('cost_per_conversion', 0))
+            except (KeyError, TypeError):
+                # Skip malformed uploads
+                continue
             
             # City data
             if 'cities' in upload['metrics']:
@@ -579,9 +589,22 @@ with st.sidebar:
         for upload in uploads[:5]:
             with st.expander(f"📅 {upload['user_label']}", expanded=False):
                 st.write(f"**Date:** {upload['timestamp'][:10]}")
-                m = upload['metrics']['granular']
-                st.write(f"**ROI:** {m['avg_roi']:.2f}x")
-                st.write(f"**Spend:** ₹{m['total_spend']:,.0f}")
+                
+                # Safely access metrics with error handling
+                try:
+                    if 'metrics' in upload and 'granular' in upload['metrics']:
+                        m = upload['metrics']['granular']
+                        st.write(f"**ROI:** {m['avg_roi']:.2f}x")
+                        st.write(f"**Spend:** ₹{m['total_spend']:,.0f}")
+                    elif 'metrics' in upload:
+                        # Old format compatibility
+                        m = upload['metrics']
+                        st.write(f"**ROI:** {m.get('avg_roi', 0):.2f}x")
+                        st.write(f"**Spend:** ₹{m.get('total_spend', 0):,.0f}")
+                    else:
+                        st.caption("Metrics not available")
+                except (KeyError, TypeError) as e:
+                    st.caption("Metrics unavailable for this upload")
                 
                 # Show what files were included
                 files_included = ["Granular"]
