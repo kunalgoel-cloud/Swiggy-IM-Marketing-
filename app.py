@@ -11,6 +11,13 @@ from pathlib import Path
 from io import BytesIO
 import hashlib
 
+# PostgreSQL imports
+import psycopg2
+from psycopg2.extras import Json
+from psycopg2.pool import SimpleConnectionPool
+import pickle
+
+
 # Page configuration
 st.set_page_config(
     page_title="Campaign Intelligence Dashboard",
@@ -60,115 +67,192 @@ st.markdown("""
 # ENHANCED HISTORY MANAGER - NOW HANDLES 3 FILES
 # ============================================================================
 
-class HistoryManager:
-    """Manages historical campaign data with support for 3 file types"""
+
+# ============================================================================
+# DATABASE MANAGER - NEON POSTGRESQL
+# This replaces the old HistoryManager with persistent database storage
+# ============================================================================
+
+class DatabaseManager:
+    """Manages all database operations with Neon PostgreSQL"""
     
-    def __init__(self, storage_dir="campaign_history"):
-        self.storage_dir = Path(storage_dir)
-        self.storage_dir.mkdir(exist_ok=True)
-        self.index_file = self.storage_dir / "index.json"
-        self._load_index()
+    def __init__(self, connection_string=None):
+        """Initialize database connection"""
+        if connection_string is None:
+            try:
+                connection_string = st.secrets.get("DATABASE_URL")
+            except:
+                try:
+                    import os
+                    connection_string = os.environ.get("DATABASE_URL")
+                except:
+                    connection_string = None
+        
+        self.connection_string = connection_string
+        self.pool = None
+        
+        if self.connection_string:
+            try:
+                self.pool = SimpleConnectionPool(1, 10, self.connection_string)
+                self._init_database()
+            except Exception as e:
+                st.error(f"Database connection failed: {str(e)}")
     
-    def _load_index(self):
-        if self.index_file.exists():
-            with open(self.index_file, 'r') as f:
-                self.index = json.load(f)
-        else:
-            self.index = {"uploads": []}
+    def _get_connection(self):
+        """Get connection from pool"""
+        if self.pool:
+            return self.pool.getconn()
+        return None
     
-    def _save_index(self):
-        with open(self.index_file, 'w') as f:
-            json.dump(self.index, f, indent=2)
+    def _return_connection(self, conn):
+        """Return connection to pool"""
+        if self.pool and conn:
+            self.pool.putconn(conn)
     
-    def _get_file_hash(self, df):
-        return hashlib.md5(pd.util.hash_pandas_object(df).values).hexdigest()
+    def _init_database(self):
+        """Initialize database schema"""
+        conn = self._get_connection()
+        if not conn:
+            return
+        
+        try:
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS campaign_uploads (
+                    upload_id VARCHAR(255) PRIMARY KEY,
+                    upload_date TIMESTAMP NOT NULL,
+                    user_label VARCHAR(255),
+                    has_placement BOOLEAN DEFAULT FALSE,
+                    has_search BOOLEAN DEFAULT FALSE,
+                    file_hash VARCHAR(64),
+                    metrics JSONB,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS campaign_granular (
+                    id SERIAL PRIMARY KEY,
+                    upload_id VARCHAR(255) REFERENCES campaign_uploads(upload_id) ON DELETE CASCADE,
+                    data BYTEA,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS campaign_placement (
+                    id SERIAL PRIMARY KEY,
+                    upload_id VARCHAR(255) REFERENCES campaign_uploads(upload_id) ON DELETE CASCADE,
+                    data BYTEA,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS campaign_search (
+                    id SERIAL PRIMARY KEY,
+                    upload_id VARCHAR(255) REFERENCES campaign_uploads(upload_id) ON DELETE CASCADE,
+                    data BYTEA,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_upload_date ON campaign_uploads(upload_date DESC)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_upload_id_granular ON campaign_granular(upload_id)")
+            
+            conn.commit()
+            cursor.close()
+        except Exception as e:
+            conn.rollback()
+            st.error(f"Database initialization error: {str(e)}")
+        finally:
+            self._return_connection(conn)
     
-    def save_multi_file_upload(self, granular_df, placement_df=None, search_df=None, user_label=None):
-        """Save all three files together as one upload"""
-        timestamp = datetime.now().isoformat()
-        upload_id = f"upload_{len(self.index['uploads']) + 1}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    def save_upload(self, granular_df, placement_df=None, search_df=None, user_label=None):
+        """Save upload to database"""
+        conn = self._get_connection()
+        if not conn:
+            st.error("No database connection available")
+            return None
         
-        # Save granular (required)
-        granular_file = self.storage_dir / f"{upload_id}_granular.parquet"
-        granular_df.to_parquet(granular_file)
-        
-        # Save placement if provided
-        has_placement = False
-        if placement_df is not None:
-            placement_file = self.storage_dir / f"{upload_id}_placement.parquet"
-            placement_df.to_parquet(placement_file)
-            has_placement = True
-        
-        # Save search if provided
-        has_search = False
-        if search_df is not None:
-            search_file = self.storage_dir / f"{upload_id}_search.parquet"
-            search_df.to_parquet(search_file)
-            has_search = True
-        
-        # Calculate comprehensive metrics
-        metrics = self._calculate_comprehensive_metrics(granular_df, placement_df, search_df)
-        
-        # Add to index
-        upload_entry = {
-            'id': upload_id,
-            'timestamp': timestamp,
-            'user_label': user_label or f"Upload {len(self.index['uploads']) + 1}",
-            'has_placement': has_placement,
-            'has_search': has_search,
-            'metrics': metrics,
-            'file_hash': self._get_file_hash(granular_df)
-        }
-        
-        self.index["uploads"].append(upload_entry)
-        self._save_index()
-        
-        return upload_id
+        try:
+            cursor = conn.cursor()
+            timestamp = datetime.now()
+            upload_id = f"upload_{timestamp.strftime('%Y%m%d_%H%M%S')}"
+            file_hash = hashlib.md5(pd.util.hash_pandas_object(granular_df).values).hexdigest()
+            
+            cursor.execute("SELECT upload_id, user_label, upload_date FROM campaign_uploads WHERE file_hash = %s", (file_hash,))
+            duplicate = cursor.fetchone()
+            if duplicate:
+                st.warning(f"⚠️ Data already uploaded on {duplicate[2].strftime('%Y-%m-%d')} as '{duplicate[1]}'")
+                self._return_connection(conn)
+                return duplicate[0]
+            
+            metrics = self._calculate_comprehensive_metrics(granular_df, placement_df, search_df)
+            
+            cursor.execute("""
+                INSERT INTO campaign_uploads 
+                (upload_id, upload_date, user_label, has_placement, has_search, file_hash, metrics)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (upload_id, timestamp, user_label or f"Upload {timestamp.strftime('%Y-%m-%d')}",
+                  placement_df is not None, search_df is not None, file_hash, Json(metrics)))
+            
+            cursor.execute("INSERT INTO campaign_granular (upload_id, data) VALUES (%s, %s)",
+                          (upload_id, psycopg2.Binary(pickle.dumps(granular_df))))
+            
+            if placement_df is not None:
+                cursor.execute("INSERT INTO campaign_placement (upload_id, data) VALUES (%s, %s)",
+                              (upload_id, psycopg2.Binary(pickle.dumps(placement_df))))
+            
+            if search_df is not None:
+                cursor.execute("INSERT INTO campaign_search (upload_id, data) VALUES (%s, %s)",
+                              (upload_id, psycopg2.Binary(pickle.dumps(search_df))))
+            
+            conn.commit()
+            cursor.close()
+            return upload_id
+        except Exception as e:
+            conn.rollback()
+            st.error(f"Error saving to database: {str(e)}")
+            return None
+        finally:
+            self._return_connection(conn)
     
     def _calculate_comprehensive_metrics(self, granular_df, placement_df, search_df):
         """Calculate metrics across all files"""
-        metrics = {
-            'granular': self._calc_metrics(granular_df),
-        }
+        metrics = {'granular': self._calc_metrics(granular_df)}
         
-        if placement_df is not None:
+        if placement_df is not None and len(placement_df) > 0:
             metrics['placement'] = {
                 'unique_keywords': int(placement_df['KEYWORD'].nunique()),
                 'keyword_count': len(placement_df),
                 'top_keyword_roi': float(placement_df.groupby('KEYWORD')['TOTAL_ROI'].mean().max()),
             }
         
-        if search_df is not None:
+        if search_df is not None and 'SEARCH_QUERY' in search_df.columns:
             metrics['search'] = {
                 'unique_queries': int(search_df['SEARCH_QUERY'].nunique()),
                 'query_count': len(search_df),
-                'top_query_roi': float(search_df.groupby('SEARCH_QUERY')['TOTAL_ROI'].mean().max()) if 'TOTAL_ROI' in search_df.columns else 0,
             }
         
-        # City-level metrics
         if 'CITY' in granular_df.columns:
-            city_metrics = granular_df.groupby('CITY').agg({
-                'TOTAL_BUDGET_BURNT': 'sum',
-                'TOTAL_GMV': 'sum',
-                'TOTAL_ROI': 'mean'
-            })
-            metrics['cities'] = {
-                'unique_cities': int(granular_df['CITY'].nunique()),
-                'top_city': str(city_metrics['TOTAL_ROI'].idxmax()),
-                'top_city_roi': float(city_metrics['TOTAL_ROI'].max()),
-            }
+            city_metrics = granular_df.groupby('CITY').agg({'TOTAL_ROI': 'mean'})
+            if len(city_metrics) > 0:
+                metrics['cities'] = {
+                    'unique_cities': int(granular_df['CITY'].nunique()),
+                    'top_city': str(city_metrics['TOTAL_ROI'].idxmax()),
+                    'top_city_roi': float(city_metrics['TOTAL_ROI'].max()),
+                }
         
-        # Product-level metrics
         if 'PRODUCT_NAME' in granular_df.columns:
-            product_metrics = granular_df.groupby('PRODUCT_NAME').agg({
-                'TOTAL_ROI': 'mean',
-                'TOTAL_GMV': 'sum'
-            })
-            metrics['products'] = {
-                'unique_products': int(granular_df['PRODUCT_NAME'].nunique()),
-                'top_product': str(product_metrics['TOTAL_ROI'].idxmax()),
-                'top_product_roi': float(product_metrics['TOTAL_ROI'].max()),
-            }
+            product_metrics = granular_df.groupby('PRODUCT_NAME').agg({'TOTAL_ROI': 'mean'})
+            if len(product_metrics) > 0:
+                metrics['products'] = {
+                    'unique_products': int(granular_df['PRODUCT_NAME'].nunique()),
+                    'top_product': str(product_metrics['TOTAL_ROI'].idxmax()),
+                    'top_product_roi': float(product_metrics['TOTAL_ROI'].max()),
+                }
         
         return metrics
     
@@ -185,94 +269,120 @@ class HistoryManager:
             'row_count': len(df)
         }
     
-    def get_all_data(self, upload_id):
-        """Load all files for a specific upload"""
-        data = {}
+    def get_all_uploads(self, limit=None):
+        """Get all uploads metadata"""
+        conn = self._get_connection()
+        if not conn:
+            return []
         
-        # Load granular (always exists)
-        granular_file = self.storage_dir / f"{upload_id}_granular.parquet"
-        if granular_file.exists():
-            data['granular'] = pd.read_parquet(granular_file)
-        
-        # Load placement if exists
-        placement_file = self.storage_dir / f"{upload_id}_placement.parquet"
-        if placement_file.exists():
-            data['placement'] = pd.read_parquet(placement_file)
-        
-        # Load search if exists
-        search_file = self.storage_dir / f"{upload_id}_search.parquet"
-        if search_file.exists():
-            data['search'] = pd.read_parquet(search_file)
-        
-        return data
+        try:
+            cursor = conn.cursor()
+            query = "SELECT upload_id, upload_date, user_label, has_placement, has_search, metrics FROM campaign_uploads ORDER BY upload_date DESC"
+            if limit:
+                query += f" LIMIT {limit}"
+            
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            
+            uploads = []
+            for row in rows:
+                uploads.append({
+                    'id': row[0],
+                    'timestamp': row[1].isoformat(),
+                    'user_label': row[2],
+                    'has_placement': row[3],
+                    'has_search': row[4],
+                    'metrics': row[5]
+                })
+            
+            cursor.close()
+            return uploads
+        except Exception as e:
+            st.error(f"Error fetching uploads: {str(e)}")
+            return []
+        finally:
+            self._return_connection(conn)
     
-    def get_all_uploads(self):
-        return sorted(self.index["uploads"], key=lambda x: x['timestamp'], reverse=True)
+    def get_upload_data(self, upload_id):
+        """Get all data for a specific upload"""
+        conn = self._get_connection()
+        if not conn:
+            return {}
+        
+        try:
+            cursor = conn.cursor()
+            data = {}
+            
+            cursor.execute("SELECT data FROM campaign_granular WHERE upload_id = %s", (upload_id,))
+            row = cursor.fetchone()
+            if row:
+                data['granular'] = pickle.loads(bytes(row[0]))
+            
+            cursor.execute("SELECT data FROM campaign_placement WHERE upload_id = %s", (upload_id,))
+            row = cursor.fetchone()
+            if row:
+                data['placement'] = pickle.loads(bytes(row[0]))
+            
+            cursor.execute("SELECT data FROM campaign_search WHERE upload_id = %s", (upload_id,))
+            row = cursor.fetchone()
+            if row:
+                data['search'] = pickle.loads(bytes(row[0]))
+            
+            cursor.close()
+            return data
+        except Exception as e:
+            st.error(f"Error loading data: {str(e)}")
+            return {}
+        finally:
+            self._return_connection(conn)
     
     def get_trend_data(self):
         """Get comprehensive trend data across all uploads"""
-        uploads = sorted(self.index["uploads"], key=lambda x: x['timestamp'])
+        conn = self._get_connection()
+        if not conn:
+            return pd.DataFrame()
         
-        trend_data = {
-            'dates': [],
-            'labels': [],
-            'spend': [],
-            'gmv': [],
-            'roi': [],
-            'conversions': [],
-            'ctr': [],
-            'cost_per_conv': [],
-            'unique_cities': [],
-            'unique_keywords': [],
-            'unique_products': [],
-            'top_city_roi': [],
-            'top_keyword_roi': [],
-        }
-        
-        for upload in uploads:
-            # Safely access metrics
-            try:
-                if 'granular' in upload['metrics']:
-                    m = upload['metrics']['granular']
-                else:
-                    # Old format - metrics directly
-                    m = upload['metrics']
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT upload_date, user_label, metrics FROM campaign_uploads ORDER BY upload_date ASC")
+            rows = cursor.fetchall()
+            
+            if not rows:
+                return pd.DataFrame()
+            
+            trend_data = {
+                'dates': [], 'labels': [], 'spend': [], 'gmv': [], 'roi': [],
+                'conversions': [], 'ctr': [], 'cost_per_conv': [],
+                'unique_cities': [], 'unique_keywords': [], 'top_city_roi': [], 'top_keyword_roi': []
+            }
+            
+            for row in rows:
+                metrics = row[2]
+                if not metrics or 'granular' not in metrics:
+                    continue
                 
-                trend_data['dates'].append(upload['timestamp'][:10])
-                trend_data['labels'].append(upload['user_label'])
+                m = metrics['granular']
+                trend_data['dates'].append(row[0].strftime('%Y-%m-%d'))
+                trend_data['labels'].append(row[1])
                 trend_data['spend'].append(m.get('total_spend', 0))
                 trend_data['gmv'].append(m.get('total_gmv', 0))
                 trend_data['roi'].append(m.get('avg_roi', 0))
                 trend_data['conversions'].append(m.get('total_conversions', 0))
                 trend_data['ctr'].append(m.get('avg_ctr', 0) * 100)
                 trend_data['cost_per_conv'].append(m.get('cost_per_conversion', 0))
-            except (KeyError, TypeError):
-                # Skip malformed uploads
-                continue
+                
+                trend_data['unique_cities'].append(metrics.get('cities', {}).get('unique_cities', 0))
+                trend_data['top_city_roi'].append(metrics.get('cities', {}).get('top_city_roi', 0))
+                trend_data['unique_keywords'].append(metrics.get('placement', {}).get('unique_keywords', 0))
+                trend_data['top_keyword_roi'].append(metrics.get('placement', {}).get('top_keyword_roi', 0))
             
-            # City data
-            if 'cities' in upload['metrics']:
-                trend_data['unique_cities'].append(upload['metrics']['cities']['unique_cities'])
-                trend_data['top_city_roi'].append(upload['metrics']['cities']['top_city_roi'])
-            else:
-                trend_data['unique_cities'].append(0)
-                trend_data['top_city_roi'].append(0)
-            
-            # Keyword data
-            if 'placement' in upload['metrics']:
-                trend_data['unique_keywords'].append(upload['metrics']['placement']['unique_keywords'])
-                trend_data['top_keyword_roi'].append(upload['metrics']['placement']['top_keyword_roi'])
-            else:
-                trend_data['unique_keywords'].append(0)
-                trend_data['top_keyword_roi'].append(0)
-            
-            # Product data
-            if 'products' in upload['metrics']:
-                trend_data['unique_products'].append(upload['metrics']['products']['unique_products'])
-            else:
-                trend_data['unique_products'].append(0)
-        
-        return pd.DataFrame(trend_data)
+            cursor.close()
+            return pd.DataFrame(trend_data)
+        except Exception as e:
+            st.error(f"Error getting trend data: {str(e)}")
+            return pd.DataFrame()
+        finally:
+            self._return_connection(conn)
     
     def get_campaign_maturity(self, df):
         """Determine campaign maturity"""
@@ -286,7 +396,7 @@ class HistoryManager:
         total_conversions = df['TOTAL_CONVERSIONS'].sum()
         
         if date_range < 3 or total_impressions < 1000 or total_conversions < 10:
-            return "NEW", "⚠️ New campaigns - wait 3-7 days for sufficient data"
+            return "NEW", "⚠️ New campaigns - wait 3-7 days"
         elif date_range < 7 or total_conversions < 30:
             return "EARLY", "🟡 Early stage - proceed with caution"
         else:
@@ -494,8 +604,8 @@ def generate_combined_insights(granular_df, placement_df, search_df, keyword_ana
 # INITIALIZE SESSION STATE
 # ============================================================================
 
-if 'history_manager' not in st.session_state:
-    st.session_state.history_manager = HistoryManager()
+if 'db_manager' not in st.session_state:
+    st.session_state.db_manager = DatabaseManager()
 
 if 'current_data' not in st.session_state:
     st.session_state.current_data = {}
@@ -505,6 +615,23 @@ if 'current_data' not in st.session_state:
 # ============================================================================
 
 st.markdown('<div class="main-header">📊 Campaign Intelligence Dashboard</div>', unsafe_allow_html=True)
+
+# Check database connection
+if not st.session_state.db_manager.connection_string:
+    st.error("""
+    ### ⚠️ Database Not Configured
+    
+    Please configure your Neon PostgreSQL connection:
+    
+    1. Go to Streamlit Cloud Settings → Secrets
+    2. Add your database URL:
+    
+    ```toml
+    DATABASE_URL = "postgresql://user:password@host.neon.tech/dbname?sslmode=require"
+    ```
+    """)
+    st.stop()
+
 st.markdown("### *Complete 3-File Analysis with Historical Tracking*")
 st.markdown("---")
 
@@ -558,7 +685,7 @@ with st.sidebar:
                 
                 if granular_df is not None:
                     # Save to history
-                    upload_id = st.session_state.history_manager.save_multi_file_upload(
+                    upload_id = st.session_state.db_manager.save_upload(
                         granular_df,
                         placement_df,
                         search_df,
@@ -581,7 +708,7 @@ with st.sidebar:
     st.markdown("---")
     st.header("📜 Upload History")
     
-    uploads = st.session_state.history_manager.get_all_uploads()
+    uploads = st.session_state.db_manager.get_all_uploads()
     
     if uploads:
         st.metric("Total Uploads", len(uploads))
@@ -615,7 +742,7 @@ with st.sidebar:
                 st.caption(f"Files: {', '.join(files_included)}")
                 
                 if st.button(f"Load", key=f"load_{upload['id']}"):
-                    data = st.session_state.history_manager.get_all_data(upload['id'])
+                    data = st.session_state.db_manager.get_upload_data(upload['id'])
                     st.session_state.current_data = data
                     st.session_state.current_data['upload_id'] = upload['id']
                     st.rerun()
@@ -647,7 +774,7 @@ if 'granular' in st.session_state.current_data and st.session_state.current_data
     
     # Check maturity
     if not force_mature:
-        maturity_level, maturity_msg = st.session_state.history_manager.get_campaign_maturity(granular_df)
+        maturity_level, maturity_msg = st.session_state.db_manager.get_campaign_maturity(granular_df)
     else:
         maturity_level = "MATURE"
         maturity_msg = "✅ Treated as mature (override enabled)"
@@ -690,7 +817,7 @@ if 'granular' in st.session_state.current_data and st.session_state.current_data
     # TREND ANALYSIS
     # ========================================================================
     
-    trend_df = st.session_state.history_manager.get_trend_data()
+    trend_df = st.session_state.db_manager.get_trend_data()
     
     if len(trend_df) > 1:
         st.header("📈 Performance Trends Over Time")
