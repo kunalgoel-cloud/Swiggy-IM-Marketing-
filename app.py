@@ -12,6 +12,11 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import io
+import hashlib
+import json
+import psycopg2
+from psycopg2.extras import execute_values
+from psycopg2 import pool as pg_pool
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIG
@@ -120,8 +125,513 @@ st.markdown("""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONSTANTS – column name maps for auto-detection
+# POSTGRESQL DATA STORE
+# Persists all campaign data to Neon PostgreSQL across sessions.
+# Falls back to session-state if DB is unavailable.
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Columns that are deduplication keys per file type
+DEDUP_KEYS = {
+    "granular":     ["date", "campaign_id", "keyword", "city", "placement"],
+    "date":         ["date", "campaign_id"],
+    "summary":      ["campaign_id"],
+    "city":         ["campaign_id", "city"],
+    "placement":    ["campaign_id", "placement"],
+    "product":      ["campaign_id", "product"],
+    "search_query": ["date", "campaign_id", "search_query"],
+    "unknown":      ["date", "campaign"],
+}
+
+# All numeric metric columns stored in DB
+METRIC_COLS = [
+    "spend", "revenue", "clicks", "impressions", "orders",
+    "budget", "a2c", "ecpm", "ecpc", "direct_gmv7", "direct_roi7",
+]
+
+# All dimension / text columns stored in DB
+DIM_COLS = [
+    "date", "campaign_id", "campaign", "status", "keyword", "city",
+    "placement", "product", "search_query", "brand", "start_date",
+    "match_type", "bidding", "phase",
+]
+
+
+@st.cache_resource(show_spinner=False)
+def _get_db_pool():
+    """Create a connection pool (cached across sessions via @cache_resource)."""
+    try:
+        conn_str = st.secrets.get("DATABASE_URL", "")
+        if not conn_str:
+            return None
+        p = pg_pool.SimpleConnectionPool(1, 5, conn_str)
+        return p
+    except Exception as e:
+        st.warning(f"⚠️ DB pool init failed: {e}")
+        return None
+
+
+def _get_conn():
+    pool = _get_db_pool()
+    if pool is None:
+        return None
+    try:
+        return pool.getconn()
+    except Exception:
+        return None
+
+
+def _release(conn):
+    pool = _get_db_pool()
+    if pool and conn:
+        try:
+            pool.putconn(conn)
+        except Exception:
+            pass
+
+
+def _init_schema():
+    """Create tables if they don't exist. Called once at startup."""
+    conn = _get_conn()
+    if conn is None:
+        return
+    try:
+        cur = conn.cursor()
+        # Main data table — one row per granular record
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS campaign_data (
+                id              BIGSERIAL PRIMARY KEY,
+                file_type       TEXT      NOT NULL,
+                row_hash        TEXT      NOT NULL,
+                date            DATE,
+                campaign_id     TEXT,
+                campaign        TEXT,
+                status          TEXT,
+                keyword         TEXT,
+                city            TEXT,
+                placement       TEXT,
+                product         TEXT,
+                search_query    TEXT,
+                brand           TEXT,
+                start_date      DATE,
+                match_type      TEXT,
+                bidding         TEXT,
+                phase           TEXT,
+                spend           NUMERIC(14,4),
+                revenue         NUMERIC(14,4),
+                clicks          BIGINT,
+                impressions     BIGINT,
+                orders          BIGINT,
+                budget          NUMERIC(14,4),
+                a2c             BIGINT,
+                ecpm            NUMERIC(10,4),
+                ecpc            NUMERIC(10,4),
+                direct_gmv7     NUMERIC(14,4),
+                direct_roi7     NUMERIC(10,4),
+                uploaded_at     TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        # Index for fast date-range queries
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_cd_date      ON campaign_data(date);
+            CREATE INDEX IF NOT EXISTS idx_cd_filetype  ON campaign_data(file_type);
+            CREATE INDEX IF NOT EXISTS idx_cd_row_hash  ON campaign_data(row_hash);
+        """)
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        st.warning(f"Schema init warning: {e}")
+    finally:
+        _release(conn)
+
+
+def _row_hash(row: pd.Series, key_cols: list[str]) -> str:
+    """SHA-1 of the dedup key values — used to detect duplicates fast."""
+    parts = "|".join(str(row.get(c, "")) for c in key_cols)
+    return hashlib.sha1(parts.encode()).hexdigest()[:16]
+
+
+class DataStore:
+    """
+    PostgreSQL-backed persistent store.
+
+    Write path:  upsert(ftype, df)
+        - Computes a row_hash for each row using DEDUP_KEYS[ftype]
+        - Fetches existing hashes from DB for that file_type
+        - Inserts only genuinely new rows (no duplicates)
+
+    Read path:   get(ftype, date_from, date_to)
+        - Queries DB with optional date filter
+        - Returns a pandas DataFrame
+
+    Fallback:    if DB is unreachable, uses st.session_state transparently
+    """
+
+    _SS_KEY = "_ds_fallback"   # session-state fallback store
+
+    # ── session-state fallback helpers ───────────────────────────────────────
+    @classmethod
+    def _ss(cls) -> dict:
+        if cls._SS_KEY not in st.session_state:
+            st.session_state[cls._SS_KEY] = {}
+        return st.session_state[cls._SS_KEY]
+
+    @classmethod
+    def _db_ok(cls) -> bool:
+        return _get_db_pool() is not None
+
+    # ── public API ───────────────────────────────────────────────────────────
+
+    @classmethod
+    def upsert(cls, ftype: str, new_df: pd.DataFrame) -> tuple[int, int]:
+        """Insert new rows, skip duplicates. Returns (added, skipped)."""
+        if new_df is None or new_df.empty:
+            return 0, 0
+
+        key_cols = DEDUP_KEYS.get(ftype, ["date", "campaign"])
+        # Only use keys that actually exist in the dataframe
+        key_cols = [c for c in key_cols if c in new_df.columns] or ["campaign"]
+
+        # Compute hash for every row
+        new_df = new_df.copy()
+        new_df["_hash"] = new_df.apply(lambda r: _row_hash(r, key_cols), axis=1)
+
+        if cls._db_ok():
+            return cls._upsert_db(ftype, new_df)
+        else:
+            return cls._upsert_ss(ftype, new_df, key_cols)
+
+    @classmethod
+    def get(cls, ftype: str,
+            date_from=None, date_to=None) -> pd.DataFrame | None:
+        """Fetch data for ftype with optional date filter."""
+        if cls._db_ok():
+            return cls._get_db(ftype, date_from, date_to)
+        else:
+            return cls._get_ss(ftype, date_from, date_to)
+
+    @classmethod
+    def all_types(cls) -> list[str]:
+        if cls._db_ok():
+            conn = _get_conn()
+            if conn is None:
+                return []
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT DISTINCT file_type FROM campaign_data ORDER BY file_type;")
+                return [r[0] for r in cur.fetchall()]
+            except Exception:
+                return []
+            finally:
+                _release(conn)
+        else:
+            return list(cls._ss().keys())
+
+    @classmethod
+    def date_range(cls) -> tuple:
+        """Return (min_date, max_date) across all stored data."""
+        if cls._db_ok():
+            conn = _get_conn()
+            if conn is None:
+                return None, None
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT MIN(date), MAX(date) FROM campaign_data WHERE date IS NOT NULL;")
+                row = cur.fetchone()
+                return (pd.Timestamp(row[0]) if row[0] else None,
+                        pd.Timestamp(row[1]) if row[1] else None)
+            except Exception:
+                return None, None
+            finally:
+                _release(conn)
+        else:
+            mins, maxs = [], []
+            for df in cls._ss().values():
+                if "date" in df.columns and df["date"].notna().any():
+                    mins.append(df["date"].min())
+                    maxs.append(df["date"].max())
+            return (min(mins) if mins else None, max(maxs) if maxs else None)
+
+    @classmethod
+    def total_rows(cls) -> int:
+        if cls._db_ok():
+            conn = _get_conn()
+            if conn is None:
+                return 0
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM campaign_data;")
+                return cur.fetchone()[0]
+            except Exception:
+                return 0
+            finally:
+                _release(conn)
+        else:
+            return sum(len(df) for df in cls._ss().values())
+
+    @classmethod
+    def summary(cls) -> pd.DataFrame:
+        if cls._db_ok():
+            conn = _get_conn()
+            if conn is None:
+                return pd.DataFrame()
+            try:
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT file_type,
+                           COUNT(*)          AS rows,
+                           MIN(date)::TEXT   AS date_from,
+                           MAX(date)::TEXT   AS date_to,
+                           MIN(uploaded_at)::DATE::TEXT AS first_upload,
+                           MAX(uploaded_at)::DATE::TEXT AS last_upload
+                    FROM campaign_data
+                    GROUP BY file_type
+                    ORDER BY file_type;
+                """)
+                cols = ["Type","Rows","Date From","Date To","First Upload","Last Upload"]
+                return pd.DataFrame(cur.fetchall(), columns=cols)
+            except Exception as e:
+                return pd.DataFrame([{"Error": str(e)}])
+            finally:
+                _release(conn)
+        else:
+            rows = []
+            for ftype, df in cls._ss().items():
+                d_min = d_max = "—"
+                if "date" in df.columns and df["date"].notna().any():
+                    d_min = str(df["date"].min().date())
+                    d_max = str(df["date"].max().date())
+                rows.append({"Type": ftype, "Rows": len(df),
+                             "Date From": d_min, "Date To": d_max})
+            return pd.DataFrame(rows)
+
+    @classmethod
+    def clear(cls):
+        if cls._db_ok():
+            conn = _get_conn()
+            if conn:
+                try:
+                    conn.cursor().execute("DELETE FROM campaign_data;")
+                    conn.commit()
+                except Exception as e:
+                    conn.rollback()
+                    st.error(f"Clear failed: {e}")
+                finally:
+                    _release(conn)
+        st.session_state[cls._SS_KEY] = {}
+
+    # ── private DB methods ────────────────────────────────────────────────────
+
+    @classmethod
+    def _upsert_db(cls, ftype: str, new_df: pd.DataFrame) -> tuple[int, int]:
+        conn = _get_conn()
+        if conn is None:
+            return cls._upsert_ss(ftype, new_df,
+                                  [c for c in DEDUP_KEYS.get(ftype, ["campaign"])
+                                   if c in new_df.columns])
+        try:
+            cur = conn.cursor()
+
+            # 1. Fetch existing hashes for this file_type
+            cur.execute(
+                "SELECT row_hash FROM campaign_data WHERE file_type = %s;",
+                (ftype,)
+            )
+            existing_hashes = {r[0] for r in cur.fetchall()}
+
+            # 2. Filter to only new rows
+            mask_new  = ~new_df["_hash"].isin(existing_hashes)
+            to_insert = new_df[mask_new]
+            added     = len(to_insert)
+            skipped   = len(new_df) - added
+
+            if added == 0:
+                return 0, skipped
+
+            # 3. Build insert rows — map DataFrame cols to DB cols
+            def _safe(val, cast=None):
+                if pd.isna(val) if not isinstance(val, str) else val == "":
+                    return None
+                if cast == "int":
+                    try: return int(float(val))
+                    except: return None
+                if cast == "float":
+                    try: return float(val)
+                    except: return None
+                if cast == "date":
+                    try: return pd.Timestamp(val).date()
+                    except: return None
+                return str(val)[:512] if val is not None else None
+
+            records = []
+            for _, row in to_insert.iterrows():
+                records.append((
+                    ftype,
+                    row["_hash"],
+                    _safe(row.get("date"),       "date"),
+                    _safe(row.get("campaign_id")),
+                    _safe(row.get("campaign")),
+                    _safe(row.get("status")),
+                    _safe(row.get("keyword")),
+                    _safe(row.get("city")),
+                    _safe(row.get("placement")),
+                    _safe(row.get("product")),
+                    _safe(row.get("search_query")),
+                    _safe(row.get("brand")),
+                    _safe(row.get("start_date"),  "date"),
+                    _safe(row.get("match_type")),
+                    _safe(row.get("bidding")),
+                    _safe(row.get("phase")),
+                    _safe(row.get("spend"),       "float"),
+                    _safe(row.get("revenue"),     "float"),
+                    _safe(row.get("clicks"),      "int"),
+                    _safe(row.get("impressions"), "int"),
+                    _safe(row.get("orders"),      "int"),
+                    _safe(row.get("budget"),      "float"),
+                    _safe(row.get("a2c"),         "int"),
+                    _safe(row.get("ecpm"),        "float"),
+                    _safe(row.get("ecpc"),        "float"),
+                    _safe(row.get("direct_gmv7"), "float"),
+                    _safe(row.get("direct_roi7"), "float"),
+                ))
+
+            insert_sql = """
+                INSERT INTO campaign_data (
+                    file_type, row_hash, date, campaign_id, campaign, status,
+                    keyword, city, placement, product, search_query, brand,
+                    start_date, match_type, bidding, phase,
+                    spend, revenue, clicks, impressions, orders, budget,
+                    a2c, ecpm, ecpc, direct_gmv7, direct_roi7
+                ) VALUES %s
+                ON CONFLICT DO NOTHING;
+            """
+            execute_values(cur, insert_sql, records, page_size=500)
+            conn.commit()
+            return added, skipped
+
+        except Exception as e:
+            conn.rollback()
+            st.warning(f"DB insert warning: {e} — falling back to session state")
+            return cls._upsert_ss(ftype, new_df,
+                                  [c for c in DEDUP_KEYS.get(ftype, ["campaign"])
+                                   if c in new_df.columns])
+        finally:
+            _release(conn)
+
+    @classmethod
+    def _get_db(cls, ftype: str, date_from=None, date_to=None) -> pd.DataFrame | None:
+        conn = _get_conn()
+        if conn is None:
+            return cls._get_ss(ftype, date_from, date_to)
+        try:
+            cur = conn.cursor()
+            params: list = [ftype]
+            where = "WHERE file_type = %s"
+            if date_from:
+                where += " AND date >= %s";  params.append(date_from)
+            if date_to:
+                where += " AND date <= %s";  params.append(date_to)
+
+            query = f"""
+                SELECT date, campaign_id, campaign, status, keyword, city,
+                       placement, product, search_query, brand, start_date,
+                       match_type, bidding, phase,
+                       spend, revenue, clicks, impressions, orders, budget,
+                       a2c, ecpm, ecpc, direct_gmv7, direct_roi7
+                FROM campaign_data {where}
+                ORDER BY date NULLS LAST, campaign;
+            """
+            cur.execute(query, params)
+            cols = [desc[0] for desc in cur.description]
+            df   = pd.DataFrame(cur.fetchall(), columns=cols)
+            if df.empty:
+                return None
+            # Re-apply types
+            for c in ["date", "start_date"]:
+                if c in df.columns:
+                    df[c] = pd.to_datetime(df[c], errors="coerce")
+            for c in ["spend","revenue","clicks","impressions","orders",
+                      "budget","a2c","ecpm","ecpc","direct_gmv7","direct_roi7"]:
+                if c in df.columns:
+                    df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+            return df
+        except Exception as e:
+            st.warning(f"DB read warning: {e}")
+            return cls._get_ss(ftype, date_from, date_to)
+        finally:
+            _release(conn)
+
+    # ── private session-state fallback methods ────────────────────────────────
+
+    @classmethod
+    def _upsert_ss(cls, ftype: str, new_df: pd.DataFrame, key_cols: list) -> tuple[int, int]:
+        ss = cls._ss()
+        if ftype not in ss:
+            ss[ftype] = new_df.drop(columns=["_hash"], errors="ignore").copy()
+            return len(new_df), 0
+        existing = ss[ftype]
+        existing_hashes = set(new_df["_hash"]) if "_hash" not in existing.columns else set(existing.get("_hash",[]))
+        # Recompute existing hashes if not cached
+        if "_hash" not in existing.columns:
+            kc = [c for c in key_cols if c in existing.columns] or ["campaign"]
+            existing["_hash"] = existing.apply(lambda r: _row_hash(r, kc), axis=1)
+        existing_hashes = set(existing["_hash"])
+        mask_new = ~new_df["_hash"].isin(existing_hashes)
+        added    = int(mask_new.sum())
+        skipped  = int((~mask_new).sum())
+        if added > 0:
+            ss[ftype] = pd.concat(
+                [existing, new_df[mask_new].drop(columns=["_hash"], errors="ignore")],
+                ignore_index=True
+            )
+        return added, skipped
+
+    @classmethod
+    def _get_ss(cls, ftype: str, date_from=None, date_to=None) -> pd.DataFrame | None:
+        df = cls._ss().get(ftype)
+        if df is None or df.empty:
+            return None
+        if date_from and "date" in df.columns:
+            df = df[df["date"] >= pd.Timestamp(date_from)]
+        if date_to and "date" in df.columns:
+            df = df[df["date"] <= pd.Timestamp(date_to)]
+        return df if not df.empty else None
+
+    @classmethod
+    def db_status(cls) -> str:
+        """Return a human-readable DB connection status string."""
+        if cls._db_ok():
+            return "🟢 PostgreSQL (Neon)"
+        return "🟡 Session state (DB unavailable)"
+
+
+# ── Initialise schema on every cold start ─────────────────────────────────────
+_init_schema()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NUMBER FORMATTING HELPER
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Columns that should show 1 decimal place in tables
+_ONE_DP_COLS = {"ROAS","CTR%","CVR%","CAC","AOV","spend","revenue",
+                "ecpm","ecpc","ROAS_7d","direct_roi7"}
+# Columns that should show 0 decimal places (integer-like)
+_ZERO_DP_COLS = {"clicks","impressions","orders","a2c","budget"}
+
+
+def round_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a display copy of df with numeric columns rounded to 1 d.p."""
+    out = df.copy()
+    for col in out.columns:
+        if not pd.api.types.is_numeric_dtype(out[col]):
+            continue
+        if col in _ZERO_DP_COLS:
+            out[col] = out[col].round(0).astype("Int64", errors="ignore")
+        else:
+            out[col] = out[col].round(1)
+    return out
+
+
 COL_MAP = {
     "date":         ["METRICS_DATE", "DATE", "date", "Day", "REPORT_DATE"],
     "campaign_id":  ["CAMPAIGN_ID"],
@@ -375,16 +885,16 @@ def budget_suggestion(row) -> dict:
                 "pct_change": 0, "color": "blue"}
 
     if roas >= 3:
-        return {"action": "🚀 Scale Up", "detail": f"ROAS {roas:.2f}x — increase budget 20-30%",
+        return {"action": "🚀 Scale Up", "detail": f"ROAS {roas:.1f}x — increase budget 20-30%",
                 "pct_change": 25, "color": "green"}
     if roas >= 1.5:
-        return {"action": "📈 Increase", "detail": f"ROAS {roas:.2f}x — increase budget 10%",
+        return {"action": "📈 Increase", "detail": f"ROAS {roas:.1f}x — increase budget 10%",
                 "pct_change": 10, "color": "green"}
     if 0.8 <= roas < 1.5:
-        return {"action": "👀 Monitor", "detail": f"ROAS {roas:.2f}x — optimise bids first",
+        return {"action": "👀 Monitor", "detail": f"ROAS {roas:.1f}x — optimise bids first",
                 "pct_change": 0, "color": "orange"}
     if 0 < roas < 0.8:
-        return {"action": "✂️ Reduce", "detail": f"ROAS {roas:.2f}x — cut budget 20%",
+        return {"action": "✂️ Reduce", "detail": f"ROAS {roas:.1f}x — cut budget 20%",
                 "pct_change": -20, "color": "red"}
     return {"action": "⏸️ Pause", "detail": "No revenue — consider pausing",
             "pct_change": -100, "color": "red"}
@@ -496,7 +1006,7 @@ def generate_alerts(df: pd.DataFrame, roas_thresh=1.0, cac_thresh=500) -> list[d
         low_roas = df[(df["ROAS"] > 0) & (df["ROAS"] < roas_thresh)]
         for _, row in low_roas.iterrows():
             alerts.append({"level":"red",
-                           "msg":f"⚠️ Low ROAS: <b>{row.get('campaign','?')}</b> — ROAS {row['ROAS']:.2f}x (target ≥ {roas_thresh}x)",
+                           "msg":f"⚠️ Low ROAS: <b>{row.get('campaign','?')}</b> — ROAS {row['ROAS']:.1f}x (target ≥ {roas_thresh}x)",
                            "action":"Reduce bids or pause under-performers"})
 
     # High CAC
@@ -512,7 +1022,7 @@ def generate_alerts(df: pd.DataFrame, roas_thresh=1.0, cac_thresh=500) -> list[d
         stars = df[df["ROAS"] >= 3]
         for _, row in stars.iterrows():
             alerts.append({"level":"green",
-                           "msg":f"🌟 Star performer: <b>{row.get('campaign','?')}</b> — ROAS {row['ROAS']:.2f}x",
+                           "msg":f"🌟 Star performer: <b>{row.get('campaign','?')}</b> — ROAS {row['ROAS']:.1f}x",
                            "action":"Increase budget 20-30%"})
 
     # Zero spend
@@ -724,22 +1234,66 @@ def main():
         cac_thresh  = st.slider("Max acceptable CAC (₹)", 50, 2000, 300, 50)
 
         st.markdown("---")
+
+        # ── STEP 3: Database summary + date filter ────────────────────────
+        st.markdown("## 🗄️ Data Store")
+
+        # Show connection status
+        db_status_str = DataStore.db_status()
+        status_color  = "alert-green" if "PostgreSQL" in db_status_str else "alert-yellow"
+        st.markdown(
+            f'<div class="{status_color}" style="margin-bottom:0.5rem">'
+            f'<b>Storage:</b> {db_status_str}</div>',
+            unsafe_allow_html=True
+        )
+
+        total_rows = DataStore.total_rows()
+        db_min, db_max = DataStore.date_range()
+
+        if total_rows > 0:
+            st.markdown(
+                f'<div class="alert-blue">'
+                f'<b>📦 {total_rows:,} rows stored</b><br>'
+                f'<small>Date range: {db_min.date() if db_min else "—"} → {db_max.date() if db_max else "—"}</small>'
+                f'</div>', unsafe_allow_html=True
+            )
+            with st.expander("📋 Store contents", expanded=False):
+                st.dataframe(DataStore.summary(), use_container_width=True, hide_index=True)
+            if st.button("🗑️ Clear all stored data", use_container_width=True):
+                DataStore.clear()
+                st.rerun()
+        else:
+            st.caption("No data stored yet. Upload files above.")
+
+        st.markdown("---")
         st.markdown("## 📅 Date Filter")
-        date_filter = st.radio("Period", ["All time","Last 7 days","Last 30 days","Custom"], index=0)
+
+        # Build filter options based on what's actually in the store
+        date_filter = st.radio(
+            "Period",
+            ["All time", "Last 7 days", "Last 30 days", "Custom"],
+            index=0
+        )
         custom_start = custom_end = None
         if date_filter == "Custom":
-            custom_start = st.date_input("From")
-            custom_end   = st.date_input("To")
+            if db_min and db_max:
+                custom_start = st.date_input("From", value=db_min.date(),
+                                             min_value=db_min.date(), max_value=db_max.date())
+                custom_end   = st.date_input("To",   value=db_max.date(),
+                                             min_value=db_min.date(), max_value=db_max.date())
+            else:
+                custom_start = st.date_input("From")
+                custom_end   = st.date_input("To")
 
     # ── Collect all uploaded files ────────────────────────────────────────────
-    # Build a flat list of (file_obj, detected_key) from named slots + auto-detect
     uploaded_pairs: list[tuple] = []
     for key, fobj in slot_files.items():
         if fobj is not None:
             uploaded_pairs.append((fobj, key))
 
     # ── No files yet — show onboarding ───────────────────────────────────────
-    if not uploaded_pairs:
+    has_stored = DataStore.total_rows() > 0
+    if not uploaded_pairs and not has_stored:
         st.markdown(f"### {fc['icon']} {frequency} Report — Getting Started")
 
         req_slots = [s for s in FILE_SLOTS if s["key"] in fc["required_files"] and frequency in s["frequency"]]
@@ -770,54 +1324,59 @@ def main():
         st.info("👈 Use the sidebar uploaders to add your files. Each report type has its own uploader so you can clearly see what's missing.")
         return
 
-    # ── Load and standardize uploaded files ──────────────────────────────────
-    datasets: dict[str, pd.DataFrame] = {}
-    file_log = []
+    # ── Upsert newly uploaded files into DataStore ────────────────────────────
+    if uploaded_pairs:
+        upsert_log = []
+        with st.spinner("Loading, deduplicating and storing data …"):
+            for fobj, ftype in uploaded_pairs:
+                raw = load_csv(fobj)
+                if raw is None:
+                    continue
+                std = standardize(raw)
+                std = learning_phase_flag(std)
+                added, skipped = DataStore.upsert(ftype, std)
+                upsert_log.append({
+                    "File": fobj.name, "Type": ftype,
+                    "New rows added": added, "Duplicate rows skipped": skipped
+                })
 
-    with st.spinner("Loading and standardizing data …"):
-        for fobj, ftype in uploaded_pairs:
-            raw = load_csv(fobj)
-            if raw is None:
-                continue
-            std = standardize(raw)
-            std = learning_phase_flag(std)
-            if ftype in datasets:
-                datasets[ftype] = pd.concat([datasets[ftype], std], ignore_index=True)
-            else:
-                datasets[ftype] = std
-            file_log.append({"File": fobj.name, "Type": ftype,
-                             "Rows": len(std), "Cols": len(std.columns)})
+        if upsert_log:
+            with st.expander("📥 Upload result", expanded=True):
+                st.dataframe(pd.DataFrame(upsert_log), use_container_width=True, hide_index=True)
+
+    # ── Resolve date bounds for DB query ──────────────────────────────────────
+    today = pd.Timestamp.today()
+    q_date_from = q_date_to = None
+
+    if date_filter == "Last 7 days":
+        q_date_from = (today - timedelta(days=7)).date()
+    elif date_filter == "Last 30 days":
+        q_date_from = (today - timedelta(days=30)).date()
+    elif date_filter == "Custom" and custom_start and custom_end:
+        q_date_from = custom_start
+        q_date_to   = custom_end
+
+    # ── Read datasets from DataStore (DB filters applied server-side) ─────────
+    datasets: dict[str, pd.DataFrame] = {}
+    for ftype in DataStore.all_types():
+        df = DataStore.get(ftype, date_from=q_date_from, date_to=q_date_to)
+        if df is not None and not df.empty:
+            # Re-apply learning phase flag after load (phase not stored for sessions fallback)
+            if "phase" not in df.columns or df["phase"].isna().all():
+                df = learning_phase_flag(df)
+            datasets[ftype] = df
 
     if not datasets:
-        st.error("No valid data could be extracted. Please check your files.")
+        st.error("No data found for the selected date range. Try 'All time' or upload more files.")
         return
 
     # ── Choose primary dataset ────────────────────────────────────────────────
-    # Preference order: granular > date > summary > others
     primary_key = next((k for k in ["granular","date","summary","city","placement","product","search_query"]
                         if k in datasets), list(datasets.keys())[0])
     primary = datasets[primary_key]
 
-    # ── Date filtering ────────────────────────────────────────────────────────
-    if "date" in primary.columns and primary["date"].notna().any():
-        min_d = primary["date"].min()
-        max_d = primary["date"].max()
-        today = pd.Timestamp.today()
-
-        if date_filter == "Last 7 days":
-            mask = primary["date"] >= today - timedelta(days=7)
-        elif date_filter == "Last 30 days":
-            mask = primary["date"] >= today - timedelta(days=30)
-        elif date_filter == "Custom" and custom_start and custom_end:
-            mask = (primary["date"] >= pd.Timestamp(custom_start)) & \
-                   (primary["date"] <= pd.Timestamp(custom_end))
-        else:
-            mask = pd.Series(True, index=primary.index)
-
-        primary = primary[mask]
-
     if primary.empty:
-        st.warning("No data in selected date range. Try 'All time'.")
+        st.warning("No data in selected date range. Try 'All time' or a different period.")
         return
 
     # ── Frequency context banner ──────────────────────────────────────────────
@@ -861,10 +1420,6 @@ def main():
                 unsafe_allow_html=True
             )
 
-    # ── Uploaded file summary ─────────────────────────────────────────────────
-    with st.expander("📋 Uploaded files detail", expanded=False):
-        st.dataframe(pd.DataFrame(file_log), use_container_width=True, hide_index=True)
-
     # ── KPI CARDS ─────────────────────────────────────────────────────────────
     st.markdown('<div class="section-title">📌 Key Performance Indicators</div>', unsafe_allow_html=True)
 
@@ -891,11 +1446,11 @@ def main():
 
     cols = st.columns(5)
     cards = [
-        ("ROAS",       f"{overall_roas:.2f}×", f"Revenue/Spend · Target ≥{roas_thresh}×",
+        ("ROAS",       f"{overall_roas:.1f}×", f"Revenue/Spend · Target ≥{roas_thresh}×",
          "green" if overall_roas >= roas_thresh else "red"),
         ("Total Spend",f"₹{total_spend:,.0f}", f"Across {primary.get('campaign',primary.get('campaign_id',pd.Series())).nunique() if 'campaign' in primary else '—'} campaigns","blue"),
-        ("CTR",        f"{overall_ctr:.2f}%",  "Clicks / Impressions","orange"),
-        ("CVR",        f"{overall_cvr:.2f}%",  "Orders / Clicks","purple"),
+        ("CTR",        f"{overall_ctr:.1f}%",  "Clicks / Impressions","orange"),
+        ("CVR",        f"{overall_cvr:.1f}%",  "Orders / Clicks","purple"),
         ("CAC",        f"₹{overall_cac:,.0f}"  if overall_cac else "—",
          f"Target ≤ ₹{cac_thresh}","red" if overall_cac > cac_thresh else "green"),
     ]
@@ -1024,7 +1579,8 @@ def main():
 
             display_cols = [c for c in ["campaign","Type","phase","spend","revenue","ROAS","CTR%","CVR%","CAC","orders","Suggestion","Advice"]
                            if c in camp_tbl.columns]
-            styled = camp_tbl[display_cols].style
+            display_df   = round_df(camp_tbl[display_cols])
+            styled = display_df.style
             if "Suggestion" in display_cols:
                 styled = styled.map(colour_suggestion, subset=["Suggestion"])
             st.dataframe(styled, use_container_width=True, hide_index=True)
@@ -1055,7 +1611,7 @@ def main():
                 phase_badge = (f'<span class="badge-learning">🔵 Learning</span>'
                                if row.get("phase") == "Learning"
                                else f'<span class="badge-stable">🟢 Stable</span>')
-                roas_str = f"{row.get('ROAS',0):.2f}×" if "ROAS" in row else "—"
+                roas_str = f"{row.get('ROAS',0):.1f}×" if "ROAS" in row else "—"
                 action_col = {"green":"#15803d","red":"#b91c1c","orange":"#b45309","blue":"#1d4ed8"}.get(sug["color"],"#374151")
                 st.markdown(f"""
                 <div style="background:#ffffff;border-radius:10px;padding:0.9rem 1.2rem;
@@ -1109,7 +1665,7 @@ def main():
                         use_container_width=True)
 
             # Table
-            st.dataframe(kw.sort_values("ROAS", ascending=False).head(100),
+            st.dataframe(round_df(kw.sort_values("ROAS", ascending=False).head(100)),
                         use_container_width=True, hide_index=True)
         else:
             st.info("No keyword data found. Upload IM_GRANULAR or IM_CAMPAIGN_X_PLACEMENT files.")
@@ -1142,7 +1698,7 @@ def main():
                                           title="City Spend vs Revenue")
                     st.plotly_chart(fig_sc, use_container_width=True)
 
-            st.dataframe(cities.head(50), use_container_width=True, hide_index=True)
+            st.dataframe(round_df(cities.head(50)), use_container_width=True, hide_index=True)
         else:
             st.info("No city data found. Upload IM_CAMPAIGN_X_CITY or IM_GRANULAR files.")
 
@@ -1170,7 +1726,7 @@ def main():
                         bar_chart(prods.nlargest(20,"ROAS"),"product","ROAS","Top Products by ROAS"),
                         use_container_width=True)
 
-            st.dataframe(prods.sort_values("ROAS",ascending=False), use_container_width=True, hide_index=True)
+            st.dataframe(round_df(prods.sort_values("ROAS",ascending=False)), use_container_width=True, hide_index=True)
         else:
             st.info("No product data found. Upload IM_CAMPAIGN_X_PRODUCT or IM_GRANULAR files.")
 
@@ -1206,10 +1762,10 @@ def main():
                 missed = sq[(sq["clicks"] >= 10) & (sq["orders"] == 0)].nlargest(20,"clicks")
                 if not missed.empty:
                     st.markdown("##### ⚠️ High-Click, Zero-Conversion Queries (review landing / bid)")
-                    st.dataframe(missed[["search_query","clicks","spend"]],
+                    st.dataframe(round_df(missed[["search_query","clicks","spend"]]),
                                 use_container_width=True, hide_index=True)
 
-            st.dataframe(sq.sort_values("ROAS",ascending=False).head(200),
+            st.dataframe(round_df(sq.sort_values("ROAS",ascending=False).head(200)),
                         use_container_width=True, hide_index=True)
         else:
             st.info("No search query data found. Upload IM_CAMPAIGN_X_SEARCH_QUERY file.")
@@ -1223,7 +1779,7 @@ def main():
 
         col_filter = st.multiselect("Select columns", raw_view.columns.tolist(),
                                    default=raw_view.columns[:12].tolist())
-        st.dataframe(raw_view[col_filter].head(500), use_container_width=True, hide_index=True)
+        st.dataframe(round_df(raw_view[col_filter].head(500)), use_container_width=True, hide_index=True)
 
         # Download
         csv_bytes = raw_view.to_csv(index=False).encode()
