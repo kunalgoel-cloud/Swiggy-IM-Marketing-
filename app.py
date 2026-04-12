@@ -32,29 +32,29 @@ st.markdown("""
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
   html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 
+  /* ── Global background: soft warm white ── */
+  .stApp                    { background: #f7f8fc; }
+  section[data-testid="stSidebar"] { background: #ffffff; border-right: 1px solid #e4e7ef; }
+
   /* ── Header ── */
   .dash-header {
-    background: linear-gradient(135deg, #0f2027, #203a43, #2c5364);
-    padding: 1.6rem 2rem;
-    border-radius: 12px;
-    margin-bottom: 1.5rem;
+    background: linear-gradient(135deg, #1a73e8, #0d47a1);
+    padding: 1.5rem 2rem;
+    border-radius: 14px;
+    margin-bottom: 1.4rem;
     text-align: center;
+    box-shadow: 0 4px 18px rgba(26,115,232,0.18);
   }
-  .dash-header h1 {
-    color: #fff;
-    font-size: 2rem;
-    font-weight: 700;
-    margin: 0;
-    letter-spacing: -0.5px;
-  }
-  .dash-header p { color: #90caf9; margin: 0.3rem 0 0; font-size: 0.9rem; }
+  .dash-header h1 { color: #fff; font-size: 1.9rem; font-weight: 700; margin: 0; letter-spacing: -0.4px; }
+  .dash-header p  { color: #cfe3ff; margin: 0.25rem 0 0; font-size: 0.88rem; }
 
   /* ── KPI cards ── */
   .kpi-card {
-    background: #1e1e2e;
+    background: #ffffff;
     border-radius: 12px;
-    padding: 1.2rem 1.5rem;
-    border: 1px solid #2a2a40;
+    padding: 1.1rem 1.4rem;
+    border: 1px solid #e4e7ef;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.06);
     position: relative;
     overflow: hidden;
   }
@@ -65,45 +65,56 @@ st.markdown("""
     width: 4px; height: 100%;
     border-radius: 4px 0 0 4px;
   }
-  .kpi-card.green::before  { background: #4caf50; }
-  .kpi-card.blue::before   { background: #2196f3; }
-  .kpi-card.orange::before { background: #ff9800; }
-  .kpi-card.red::before    { background: #f44336; }
-  .kpi-card.purple::before { background: #9c27b0; }
-  .kpi-label { font-size: 0.75rem; color: #888; text-transform: uppercase; letter-spacing: 0.05em; }
-  .kpi-value { font-size: 1.8rem; font-weight: 700; color: #fff; line-height: 1.2; }
-  .kpi-sub   { font-size: 0.78rem; color: #aaa; margin-top: 0.2rem; }
+  .kpi-card.green::before  { background: #2e7d32; }
+  .kpi-card.blue::before   { background: #1565c0; }
+  .kpi-card.orange::before { background: #e65100; }
+  .kpi-card.red::before    { background: #c62828; }
+  .kpi-card.purple::before { background: #6a1b9a; }
+  .kpi-label { font-size: 0.72rem; color: #6b7280; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; }
+  .kpi-value { font-size: 1.7rem; font-weight: 700; color: #111827; line-height: 1.2; margin-top: 0.15rem; }
+  .kpi-sub   { font-size: 0.76rem; color: #9ca3af; margin-top: 0.2rem; }
 
   /* ── Alert boxes ── */
-  .alert-red    { background:#3b1a1a; border-left:4px solid #f44336; padding:0.8rem 1rem; border-radius:8px; color:#ffcdd2; margin:0.4rem 0; }
-  .alert-yellow { background:#3b2e00; border-left:4px solid #ffc107; padding:0.8rem 1rem; border-radius:8px; color:#fff8e1; margin:0.4rem 0; }
-  .alert-green  { background:#0d2b0d; border-left:4px solid #4caf50; padding:0.8rem 1rem; border-radius:8px; color:#c8e6c9; margin:0.4rem 0; }
-  .alert-blue   { background:#0d1f3b; border-left:4px solid #2196f3; padding:0.8rem 1rem; border-radius:8px; color:#bbdefb; margin:0.4rem 0; }
+  .alert-red    { background:#fff5f5; border-left:4px solid #e53e3e; padding:0.75rem 1rem; border-radius:8px; color:#742a2a; margin:0.35rem 0; }
+  .alert-yellow { background:#fffbeb; border-left:4px solid #d97706; padding:0.75rem 1rem; border-radius:8px; color:#78350f; margin:0.35rem 0; }
+  .alert-green  { background:#f0fdf4; border-left:4px solid #16a34a; padding:0.75rem 1rem; border-radius:8px; color:#14532d; margin:0.35rem 0; }
+  .alert-blue   { background:#eff6ff; border-left:4px solid #2563eb; padding:0.75rem 1rem; border-radius:8px; color:#1e3a8a; margin:0.35rem 0; }
 
   /* ── Learning badge ── */
-  .badge-learning { background:#1a237e; color:#90caf9; padding:2px 8px; border-radius:20px; font-size:0.72rem; font-weight:600; }
-  .badge-stable   { background:#1b5e20; color:#a5d6a7; padding:2px 8px; border-radius:20px; font-size:0.72rem; font-weight:600; }
+  .badge-learning { background:#dbeafe; color:#1e40af; padding:2px 9px; border-radius:20px; font-size:0.71rem; font-weight:700; }
+  .badge-stable   { background:#dcfce7; color:#166534; padding:2px 9px; border-radius:20px; font-size:0.71rem; font-weight:700; }
 
   /* ── Section title ── */
   .section-title {
-    font-size: 1.15rem; font-weight: 600; color: #e0e0e0;
-    border-bottom: 2px solid #2196f3;
-    padding-bottom: 0.4rem; margin: 1.2rem 0 0.8rem;
+    font-size: 1.08rem; font-weight: 700; color: #1e293b;
+    border-bottom: 2px solid #1a73e8;
+    padding-bottom: 0.35rem; margin: 1.1rem 0 0.75rem;
+    letter-spacing: -0.2px;
   }
 
   /* ── Action pill ── */
   .action-pill {
     display: inline-block;
-    background: #1565c0; color: #fff;
-    border-radius: 20px; padding: 4px 12px;
-    font-size: 0.78rem; font-weight: 600;
+    background: #1a73e8; color: #fff;
+    border-radius: 20px; padding: 3px 11px;
+    font-size: 0.76rem; font-weight: 600;
     margin: 2px;
   }
 
-  /* ── Streamlit overrides ── */
-  .stApp { background: #12121f; }
-  .stDataFrame { border-radius: 8px; }
-  div[data-testid="stMetric"] { background: #1e1e2e; border-radius:8px; padding:0.6rem 1rem; }
+  /* ── Streamlit component overrides ── */
+  .stDataFrame               { border-radius: 10px; border: 1px solid #e4e7ef; }
+  div[data-testid="stMetric"]{ background: #ffffff; border-radius: 10px;
+                               padding: 0.6rem 1rem; border: 1px solid #e4e7ef;
+                               box-shadow: 0 1px 4px rgba(0,0,0,0.05); }
+  .stTabs [data-baseweb="tab-list"] { background: #eef2ff; border-radius: 10px; padding: 3px; }
+  .stTabs [data-baseweb="tab"]      { border-radius: 8px; font-weight: 500; color: #374151; }
+  .stTabs [aria-selected="true"]    { background: #ffffff !important; color: #1a73e8 !important;
+                                      font-weight: 700; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
+  div[data-testid="stExpander"]     { background: #ffffff; border: 1px solid #e4e7ef;
+                                      border-radius: 10px; }
+  .stRadio > label                  { color: #374151 !important; font-weight: 500; }
+  .stSlider [data-testid="stWidgetLabel"] { color: #374151; font-weight: 500; }
+  code { background: #eef2ff; color: #1e40af; border-radius: 4px; padding: 1px 5px; font-size: 0.82rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -435,13 +446,13 @@ def campaign_summary_table(df: pd.DataFrame) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────────────────────
 # CHART BUILDERS
 # ─────────────────────────────────────────────────────────────────────────────
-PLOTLY_TEMPLATE = "plotly_dark"
+PLOTLY_TEMPLATE = "plotly_white"
 CHART_HEIGHT    = 320
 
 
 def line_chart(df, x, y_cols, title, y_label="Value"):
     fig = go.Figure()
-    colors = ["#2196f3","#4caf50","#ff9800","#e91e63","#9c27b0"]
+    colors = ["#1d4ed8","#15803d","#b45309","#be185d","#6d28d9"]
     for i, col in enumerate(y_cols):
         if col in df.columns:
             fig.add_trace(go.Scatter(
@@ -949,10 +960,12 @@ def main():
                     fig = go.Figure()
                     fig.add_trace(go.Scatter(x=daily["date"], y=daily["spend"],
                                             name="Spend", fill="tozeroy",
-                                            line=dict(color="#ef5350",width=2)))
+                                            line=dict(color="#dc2626",width=2),
+                                            fillcolor="rgba(220,38,38,0.08)"))
                     fig.add_trace(go.Scatter(x=daily["date"], y=daily["revenue"],
                                             name="Revenue", fill="tozeroy",
-                                            line=dict(color="#66bb6a",width=2)))
+                                            line=dict(color="#16a34a",width=2),
+                                            fillcolor="rgba(22,163,74,0.08)"))
                     fig.update_layout(template=PLOTLY_TEMPLATE, title="Spend vs Revenue (Daily)",
                                       height=CHART_HEIGHT, yaxis_title="₹")
                     st.plotly_chart(fig, use_container_width=True)
@@ -962,11 +975,11 @@ def main():
                     fig2 = go.Figure()
                     fig2.add_trace(go.Scatter(x=daily["date"], y=daily["ROAS"],
                                              mode="lines+markers", name="ROAS",
-                                             line=dict(color="#42a5f5",width=2.5),
+                                             line=dict(color="#1d4ed8",width=2.5),
                                              marker=dict(size=6)))
-                    fig2.add_hline(y=roas_thresh, line_dash="dash", line_color="#ffc107",
+                    fig2.add_hline(y=roas_thresh, line_dash="dash", line_color="#d97706",
                                   annotation_text=f"Target {roas_thresh}×")
-                    fig2.add_hline(y=1.0, line_dash="dot", line_color="#ef5350",
+                    fig2.add_hline(y=1.0, line_dash="dot", line_color="#dc2626",
                                   annotation_text="Break-even")
                     fig2.update_layout(template=PLOTLY_TEMPLATE, title="Daily ROAS",
                                        height=CHART_HEIGHT, yaxis_title="ROAS (×)")
@@ -1004,17 +1017,17 @@ def main():
 
             # Table with colour-coded suggestions
             def colour_suggestion(val):
-                if "Scale" in str(val) or "Increase" in str(val): return "color: #66bb6a; font-weight:600"
-                if "Pause" in str(val) or "Reduce" in str(val):   return "color: #ef5350; font-weight:600"
-                if "Wait"  in str(val):                            return "color: #42a5f5"
-                return "color: #ffa726"
+                if "Scale" in str(val) or "Increase" in str(val): return "color: #15803d; font-weight:700"
+                if "Pause" in str(val) or "Reduce" in str(val):   return "color: #b91c1c; font-weight:700"
+                if "Wait"  in str(val):                            return "color: #1d4ed8"
+                return "color: #b45309; font-weight:600"
 
             display_cols = [c for c in ["campaign","Type","phase","spend","revenue","ROAS","CTR%","CVR%","CAC","orders","Suggestion","Advice"]
                            if c in camp_tbl.columns]
-            st.dataframe(
-                camp_tbl[display_cols].style.applymap(colour_suggestion, subset=["Suggestion"] if "Suggestion" in display_cols else []),
-                use_container_width=True, hide_index=True
-            )
+            styled = camp_tbl[display_cols].style
+            if "Suggestion" in display_cols:
+                styled = styled.map(colour_suggestion, subset=["Suggestion"])
+            st.dataframe(styled, use_container_width=True, hide_index=True)
 
             # ROAS scatter
             if "ROAS" in camp_tbl.columns and "spend" in camp_tbl.columns:
@@ -1024,7 +1037,7 @@ def main():
                     color="ROAS", text="campaign" if "campaign" in camp_tbl.columns else None,
                     title="Campaign Bubble: Spend vs ROAS (size = Revenue)"
                 )
-                fig_s.add_hline(y=roas_thresh, line_dash="dash", line_color="#ffc107",
+                fig_s.add_hline(y=roas_thresh, line_dash="dash", line_color="#d97706",
                                annotation_text=f"ROAS Target {roas_thresh}×")
                 st.plotly_chart(fig_s, use_container_width=True)
         else:
@@ -1043,16 +1056,17 @@ def main():
                                if row.get("phase") == "Learning"
                                else f'<span class="badge-stable">🟢 Stable</span>')
                 roas_str = f"{row.get('ROAS',0):.2f}×" if "ROAS" in row else "—"
-                action_col = {"green":"#66bb6a","red":"#ef5350","orange":"#ffa726","blue":"#42a5f5"}.get(sug["color"],"#fff")
+                action_col = {"green":"#15803d","red":"#b91c1c","orange":"#b45309","blue":"#1d4ed8"}.get(sug["color"],"#374151")
                 st.markdown(f"""
-                <div style="background:#1e1e2e;border-radius:10px;padding:0.9rem 1.2rem;
-                            border-left:4px solid {action_col};margin:0.5rem 0;">
-                  <b style="color:#e0e0e0">{row.get('campaign','Campaign')}</b>
+                <div style="background:#ffffff;border-radius:10px;padding:0.9rem 1.2rem;
+                            border:1px solid #e4e7ef;border-left:4px solid {action_col};
+                            margin:0.5rem 0;box-shadow:0 1px 4px rgba(0,0,0,0.06);">
+                  <b style="color:#111827">{row.get('campaign','Campaign')}</b>
                   &nbsp;{phase_badge}&nbsp;
-                  <span style="color:#aaa;font-size:0.82rem">ROAS {roas_str} | Spend ₹{spend:,.0f}</span><br>
+                  <span style="color:#6b7280;font-size:0.82rem">ROAS {roas_str} | Spend ₹{spend:,.0f}</span><br>
                   <span style="color:{action_col};font-weight:700;font-size:1.05rem">{sug['action']}</span>
-                  &nbsp;&nbsp;<span style="color:#bbb;font-size:0.85rem">{sug['detail']}</span>
-                  {f'<br><span style="color:#aaa;font-size:0.8rem">→ Suggested budget: ₹{new_spend:,.0f}</span>' if new_spend != spend else ''}
+                  &nbsp;&nbsp;<span style="color:#374151;font-size:0.85rem">{sug['detail']}</span>
+                  {f'<br><span style="color:#6b7280;font-size:0.8rem">→ Suggested budget: ₹{new_spend:,.0f}</span>' if new_spend != spend else ''}
                 </div>""", unsafe_allow_html=True)
         else:
             st.info("Upload data with spend & revenue columns to see budget recommendations.")
@@ -1219,7 +1233,7 @@ def main():
     # ── FOOTER ───────────────────────────────────────────────────────────────
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown(
-        '<div style="text-align:center;color:#555;font-size:0.78rem;">'
+        '<div style="text-align:center;color:#9ca3af;font-size:0.78rem;padding:1rem 0;">'
         '📊 Campaign Intelligence Dashboard · Built for Instamart Ads · '
         'Data is processed locally in your browser session'
         '</div>', unsafe_allow_html=True)
