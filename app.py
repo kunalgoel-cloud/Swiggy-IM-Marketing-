@@ -146,20 +146,41 @@ COL_MAP = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 def find_header_row(raw_df: pd.DataFrame) -> int:
-    """Find the row index that contains actual column headers (skip metadata rows)."""
+    """
+    Find the row index containing real column headers, skipping Instamart-style
+    metadata rows (From Date, To Date, Ads Type, Campaign Name or ID, blank row).
+
+    Strategy: the true header row in IM_* exports is always the FIRST row where
+    ≥ 5 values are ALL_CAPS_WITH_UNDERSCORE tokens (e.g. METRICS_DATE,
+    CAMPAIGN_ID, TOTAL_GMV …).  Metadata rows like 'Campaign Name or ID'
+    / 'All Campaigns' never satisfy that strict criterion.
+    """
     for i, row in raw_df.iterrows():
-        vals = [str(v) for v in row.dropna().values]
+        vals = [str(v).strip() for v in row.dropna().values if str(v).strip()]
         if not vals:
             continue
-        # Look for typical field-name patterns: ALL_CAPS_WITH_UNDERSCORE or mixed
-        caps_like = sum(1 for v in vals if v.replace("_", "").isalpha() and v == v.upper() and len(v) > 2)
-        if caps_like >= 3:
+        # Strict ALL_CAPS_UNDERSCORE check — must have at least 5 such tokens
+        # This matches METRICS_DATE, CAMPAIGN_ID, TOTAL_GMV etc. but NOT
+        # mixed-case metadata like 'Campaign Name or ID'
+        strict_caps = sum(
+            1 for v in vals
+            if v == v.upper()               # entirely uppercase
+            and v.replace("_", "").isalpha()# only letters + underscores
+            and "_" in v                    # must contain underscore (rules out dates like '01/03/2026')
+            and len(v) > 3
+        )
+        if strict_caps >= 5:
             return i
-        # Also accept mixed-case names that look like column headers
-        header_like = sum(1 for v in vals if any(kw in v.upper() for kw in
-                          ["DATE","CAMPAIGN","IMPRESSION","CLICK","SPEND","GMV","ROI","BUDGET","BRAND"]))
-        if header_like >= 2:
+
+        # Fallback: row has many keyword-bearing column-name tokens AND
+        # none of its values look like a date or a long prose string
+        kw_count = sum(1 for v in vals if any(kw in v.upper() for kw in
+                       ["METRICS_DATE","CAMPAIGN_ID","CAMPAIGN_NAME",
+                        "TOTAL_IMPRESSIONS","TOTAL_CLICKS","TOTAL_GMV",
+                        "TOTAL_BUDGET","TOTAL_ROI","BRAND_NAME"]))
+        if kw_count >= 3:
             return i
+
     return 0
 
 
