@@ -545,14 +545,15 @@ class DataStore:
             df   = pd.DataFrame(cur.fetchall(), columns=cols)
             if df.empty:
                 return None
-            # Re-apply types
+            # Re-apply types — psycopg2 returns NUMERIC as Python Decimal
             for c in ["date", "start_date"]:
                 if c in df.columns:
                     df[c] = pd.to_datetime(df[c], errors="coerce")
+            # Force ALL metric columns to float64 (Decimal → float)
             for c in ["spend","revenue","clicks","impressions","orders",
                       "budget","a2c","ecpm","ecpc","direct_gmv7","direct_roi7"]:
                 if c in df.columns:
-                    df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+                    df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(float)
             return df
         except Exception as e:
             st.warning(f"DB read warning: {e}")
@@ -612,26 +613,77 @@ _init_schema()
 # NUMBER FORMATTING HELPER
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Columns that should show 1 decimal place in tables
-_ONE_DP_COLS = {"ROAS","CTR%","CVR%","CAC","AOV","spend","revenue",
-                "ecpm","ecpc","ROAS_7d","direct_roi7"}
-# Columns that should show 0 decimal places (integer-like)
-_ZERO_DP_COLS = {"clicks","impressions","orders","a2c","budget"}
+# Columns that show 0 decimal places (integer counts)
+_ZERO_DP_COLS = {"clicks", "impressions", "orders", "a2c", "budget"}
+
+# Everything numeric that isn't a count gets 1 decimal place
+# (ROAS, CTR%, CVR%, CAC, AOV, spend, revenue, ecpm, ecpc, etc.)
 
 
 def round_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a display copy of df with numeric columns rounded to 1 d.p."""
+    """
+    Return a display-ready copy of df:
+    - Forces all object/Decimal columns that contain numbers to float first
+      (psycopg2 returns NUMERIC as Python Decimal which is dtype=object)
+    - Integer-count columns → 0 dp, displayed as Int64
+    - All other numeric columns → 1 dp
+    """
     out = df.copy()
     for col in out.columns:
+        series = out[col]
+
+        # ── Step 1: coerce Decimal / mixed-object columns to float ───────────
+        if series.dtype == object:
+            try:
+                converted = pd.to_numeric(series, errors="coerce")
+                # Only replace if at least some values converted successfully
+                if converted.notna().sum() > 0 and series.notna().sum() > 0:
+                    if converted.notna().sum() / series.notna().sum() > 0.5:
+                        out[col] = converted
+                        series = out[col]
+            except Exception:
+                pass
+
+        # ── Step 2: round based on column name ──────────────────────────────
         if not pd.api.types.is_numeric_dtype(out[col]):
-            continue
+            continue  # skip text columns
+
         if col in _ZERO_DP_COLS:
             out[col] = out[col].round(0).astype("Int64", errors="ignore")
         else:
             out[col] = out[col].round(1)
+
     return out
 
 
+def _compute_kpis(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Force metric cols to float, then compute and round ROAS/CTR%/CVR%/CAC to 1dp.
+    Safe to call on any aggregated DataFrame.
+    """
+    # Coerce metrics (handles Decimal from PostgreSQL)
+    for c in ["spend","revenue","clicks","impressions","orders"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(float)
+
+    if "spend" in df.columns and "revenue" in df.columns:
+        df["ROAS"] = np.where(df["spend"] > 0,
+                              (df["revenue"] / df["spend"]).round(1), 0.0)
+    if "clicks" in df.columns and "impressions" in df.columns:
+        df["CTR%"] = np.where(df["impressions"] > 0,
+                              (df["clicks"] / df["impressions"] * 100).round(1), 0.0)
+    if "orders" in df.columns and "clicks" in df.columns:
+        df["CVR%"] = np.where(df["clicks"] > 0,
+                              (df["orders"] / df["clicks"] * 100).round(1), 0.0)
+    if "spend" in df.columns and "orders" in df.columns:
+        df["CAC"]  = np.where(df["orders"] > 0,
+                              (df["spend"] / df["orders"]).round(1), np.nan)
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSTANTS – column name maps for auto-detection
+# ─────────────────────────────────────────────────────────────────────────────
 COL_MAP = {
     "date":         ["METRICS_DATE", "DATE", "date", "Day", "REPORT_DATE"],
     "campaign_id":  ["CAMPAIGN_ID"],
@@ -920,6 +972,11 @@ def campaign_summary_table(df: pd.DataFrame) -> pd.DataFrame:
     if "campaign_id" in df.columns:
         grp = ["campaign_id","campaign"]
 
+    # Force metric cols to numeric first (handles Decimal from PostgreSQL)
+    for c in ["spend","revenue","clicks","impressions","orders"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
     agg_dict = {}
     for c in ["spend","revenue","clicks","impressions","orders"]:
         if c in df.columns:
@@ -933,15 +990,38 @@ def campaign_summary_table(df: pd.DataFrame) -> pd.DataFrame:
 
     tbl = df.groupby(grp).agg(agg_dict).reset_index()
 
-    # Re-compute KPIs on aggregated data
-    tbl["ROAS"] = np.where(tbl.get("spend",pd.Series(0)) > 0,
-                           tbl.get("revenue", 0) / tbl["spend"], 0) if "spend" in tbl.columns and "revenue" in tbl.columns else 0
-    tbl["CTR%"] = np.where(tbl.get("impressions",pd.Series(0)) > 0,
-                           tbl.get("clicks",0) / tbl["impressions"] * 100, 0) if "clicks" in tbl.columns and "impressions" in tbl.columns else 0
-    tbl["CVR%"] = np.where(tbl.get("clicks",pd.Series(0)) > 0,
-                           tbl.get("orders",0) / tbl["clicks"] * 100, 0) if "orders" in tbl.columns and "clicks" in tbl.columns else 0
-    tbl["CAC"]  = np.where(tbl.get("orders",pd.Series(0)) > 0,
-                           tbl.get("spend",0) / tbl["orders"], np.nan) if "spend" in tbl.columns and "orders" in tbl.columns else np.nan
+    # Re-compute KPIs and round immediately to 1 dp
+    if "spend" in tbl.columns and "revenue" in tbl.columns:
+        tbl["ROAS"] = np.where(tbl["spend"] > 0,
+                               (tbl["revenue"] / tbl["spend"]).round(1), 0.0)
+    else:
+        tbl["ROAS"] = 0.0
+
+    if "clicks" in tbl.columns and "impressions" in tbl.columns:
+        tbl["CTR%"] = np.where(tbl["impressions"] > 0,
+                               (tbl["clicks"] / tbl["impressions"] * 100).round(1), 0.0)
+    else:
+        tbl["CTR%"] = 0.0
+
+    if "orders" in tbl.columns and "clicks" in tbl.columns:
+        tbl["CVR%"] = np.where(tbl["clicks"] > 0,
+                               (tbl["orders"] / tbl["clicks"] * 100).round(1), 0.0)
+    else:
+        tbl["CVR%"] = 0.0
+
+    if "spend" in tbl.columns and "orders" in tbl.columns:
+        tbl["CAC"] = np.where(tbl["orders"] > 0,
+                              (tbl["spend"] / tbl["orders"]).round(1), np.nan)
+    else:
+        tbl["CAC"] = np.nan
+
+    # Round raw metric cols too
+    for c in ["spend","revenue"]:
+        if c in tbl.columns:
+            tbl[c] = tbl[c].round(1)
+    for c in ["clicks","impressions","orders"]:
+        if c in tbl.columns:
+            tbl[c] = tbl[c].round(0).astype("Int64", errors="ignore")
 
     if "campaign" in tbl.columns:
         tbl["Type"] = tbl["campaign"].apply(classify_campaign)
@@ -1095,7 +1175,7 @@ FILE_SLOTS = [
         "filename":  "IM_CAMPAIGN_X_SEARCH_QUERY_*",
         "help":      "User search terms — for keyword mining & negatives.",
         "required":  False,
-        "frequency": ["Weekly", "Monthly"],
+        "frequency": ["Daily", "Weekly", "Monthly"],   # ← available in all frequencies
     },
 ]
 
@@ -1106,7 +1186,7 @@ FREQUENCY_CONFIG = {
         "focus":       ["Spend","Revenue","CTR","ROAS"],
         "description": "Track day-over-day spend pacing and ROAS. Catch budget exhaustion early.",
         "required_files": ["granular","date"],
-        "optional_files": ["city","placement"],
+        "optional_files": ["city","placement","search_query"],   # ← added search_query
     },
     "Weekly": {
         "icon":        "📆",
@@ -1497,6 +1577,10 @@ def main():
 
         date_src = datasets.get("date", datasets.get("granular"))
         if date_src is not None and "date" in date_src.columns:
+            # Coerce metrics to float (handles Decimal from PostgreSQL)
+            for _c in ["spend","revenue","clicks","impressions","orders"]:
+                if _c in date_src.columns:
+                    date_src[_c] = pd.to_numeric(date_src[_c], errors="coerce").fillna(0).astype(float)
             daily = date_src.groupby("date").agg(
                 spend=("spend","sum") if "spend" in date_src.columns else ("spend","first"),
                 revenue=("revenue","sum") if "revenue" in date_src.columns else ("revenue","first"),
@@ -1504,10 +1588,11 @@ def main():
                 impressions=("impressions","sum") if "impressions" in date_src.columns else ("impressions","first"),
                 orders=("orders","sum") if "orders" in date_src.columns else ("orders","first"),
             ).reset_index()
-            # Recompute daily ROAS
-            daily["ROAS"] = np.where(daily["spend"] > 0, daily["revenue"] / daily["spend"], 0)
+            # Recompute daily KPIs rounded to 1dp
+            daily["ROAS"] = np.where(daily["spend"] > 0,
+                                     (daily["revenue"] / daily["spend"]).round(1), 0.0)
             daily["CTR%"] = np.where(daily["impressions"] > 0,
-                                     daily["clicks"] / daily["impressions"] * 100, 0)
+                                     (daily["clicks"] / daily["impressions"] * 100).round(1), 0.0)
 
             c1, c2 = st.columns(2)
             with c1:
@@ -1639,11 +1724,7 @@ def main():
 
             kw_agg_dict = {c:"sum" for c in ["spend","revenue","clicks","impressions","orders"] if c in kw_src.columns}
             kw = kw_src.groupby(kw_grp_cols).agg(kw_agg_dict).reset_index()
-
-            kw["ROAS"] = np.where(kw.get("spend",pd.Series(0)) > 0,
-                                  kw.get("revenue",0) / kw["spend"], 0) if "spend" in kw.columns and "revenue" in kw.columns else 0
-            kw["CTR%"] = np.where(kw.get("impressions",pd.Series(0)) > 0,
-                                  kw.get("clicks",0) / kw["impressions"] * 100, 0) if "clicks" in kw.columns and "impressions" in kw.columns else 0
+            kw = _compute_kpis(kw)
             kw["Bucket"] = kw["keyword"].apply(keyword_bucket)
             kw["Status"] = kw["ROAS"].apply(
                 lambda r: "🟢 Scale" if r >= roas_thresh else ("🟡 Monitor" if r >= 0.8 else "🔴 Pause"))
@@ -1678,8 +1759,7 @@ def main():
         if city_src is not None and "city" in city_src.columns:
             city_agg_dict = {c:"sum" for c in ["spend","revenue","clicks","impressions","orders"] if c in city_src.columns}
             cities = city_src.groupby("city").agg(city_agg_dict).reset_index()
-            cities["ROAS"] = np.where(cities.get("spend",pd.Series(0)) > 0,
-                                      cities.get("revenue",0) / cities["spend"], 0) if "spend" in cities.columns and "revenue" in cities.columns else 0
+            cities = _compute_kpis(cities)
             cities = cities.sort_values("revenue" if "revenue" in cities.columns else "spend", ascending=False)
 
             c1,c2 = st.columns(2)
@@ -1710,8 +1790,7 @@ def main():
         if prod_src is not None and "product" in prod_src.columns:
             prod_agg = {c:"sum" for c in ["spend","revenue","clicks","orders"] if c in prod_src.columns}
             prods = prod_src.groupby("product").agg(prod_agg).reset_index()
-            prods["ROAS"] = np.where(prods.get("spend",pd.Series(0)) > 0,
-                                     prods.get("revenue",0) / prods["spend"], 0) if "spend" in prods.columns and "revenue" in prods.columns else 0
+            prods = _compute_kpis(prods)
 
             c1,c2 = st.columns(2)
             with c1:
@@ -1738,8 +1817,7 @@ def main():
         if sq_src is not None and "search_query" in sq_src.columns:
             sq_agg = {c:"sum" for c in ["spend","revenue","clicks","impressions","orders"] if c in sq_src.columns}
             sq = sq_src.groupby("search_query").agg(sq_agg).reset_index()
-            sq["ROAS"] = np.where(sq.get("spend",pd.Series(0)) > 0,
-                                  sq.get("revenue",0) / sq["spend"], 0) if "spend" in sq.columns and "revenue" in sq.columns else 0
+            sq = _compute_kpis(sq)
             sq["intent"] = sq["search_query"].apply(keyword_bucket)
 
             c1,c2 = st.columns(2)
