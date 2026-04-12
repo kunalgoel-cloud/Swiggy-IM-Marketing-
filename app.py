@@ -495,6 +495,95 @@ def generate_alerts(df: pd.DataFrame, roas_thresh=1.0, cac_thresh=500) -> list[d
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FILE SLOT DEFINITIONS  – one entry per distinct report type
+# ─────────────────────────────────────────────────────────────────────────────
+FILE_SLOTS = [
+    {
+        "key":       "granular",
+        "label":     "📊 Granular Report",
+        "filename":  "IM_GRANULAR_*",
+        "help":      "Keyword × City × Day breakdown. Most detailed – required for keyword & city tabs.",
+        "required":  True,
+        # Which report frequencies need this file
+        "frequency": ["Daily", "Weekly", "Monthly"],
+    },
+    {
+        "key":       "date",
+        "label":     "📅 Campaign × Date Report",
+        "filename":  "IM_CAMPAIGN_X_DATE_*",
+        "help":      "Daily campaign-level metrics. Powers the Trends tab.",
+        "required":  True,
+        "frequency": ["Daily", "Weekly", "Monthly"],
+    },
+    {
+        "key":       "summary",
+        "label":     "📋 Summary Report",
+        "filename":  "IM_SUMMARY_*",
+        "help":      "Overall campaign totals. Good for weekly/monthly reviews.",
+        "required":  False,
+        "frequency": ["Weekly", "Monthly"],
+    },
+    {
+        "key":       "city",
+        "label":     "🏙️ Campaign × City Report",
+        "filename":  "IM_CAMPAIGN_X_CITY_*",
+        "help":      "City-level spend & GMV breakdown.",
+        "required":  False,
+        "frequency": ["Daily", "Weekly", "Monthly"],
+    },
+    {
+        "key":       "placement",
+        "label":     "📍 Campaign × Placement Report",
+        "filename":  "IM_CAMPAIGN_X_PLACEMENT_*",
+        "help":      "Ad-placement / keyword performance.",
+        "required":  False,
+        "frequency": ["Daily", "Weekly", "Monthly"],
+    },
+    {
+        "key":       "product",
+        "label":     "📦 Campaign × Product Report",
+        "filename":  "IM_CAMPAIGN_X_PRODUCT_*",
+        "help":      "Product-level GMV & ROAS.",
+        "required":  False,
+        "frequency": ["Weekly", "Monthly"],
+    },
+    {
+        "key":       "search_query",
+        "label":     "🔍 Search Query Report",
+        "filename":  "IM_CAMPAIGN_X_SEARCH_QUERY_*",
+        "help":      "User search terms — for keyword mining & negatives.",
+        "required":  False,
+        "frequency": ["Weekly", "Monthly"],
+    },
+]
+
+# Frequency → which KPI views make most sense
+FREQUENCY_CONFIG = {
+    "Daily": {
+        "icon":        "🗓️",
+        "focus":       ["Spend","Revenue","CTR","ROAS"],
+        "description": "Track day-over-day spend pacing and ROAS. Catch budget exhaustion early.",
+        "required_files": ["granular","date"],
+        "optional_files": ["city","placement"],
+    },
+    "Weekly": {
+        "icon":        "📆",
+        "focus":       ["ROAS","CAC","CVR","Budget trends"],
+        "description": "Review weekly ROAS & CAC trends. Adjust bids and budgets for the coming week.",
+        "required_files": ["granular","date","summary"],
+        "optional_files": ["city","placement","search_query"],
+    },
+    "Monthly": {
+        "icon":        "🗃️",
+        "focus":       ["Growth","Contribution","AOV","Channel mix"],
+        "description": "Monthly growth analysis, product contribution, and channel efficiency review.",
+        "required_files": ["granular","date","summary"],
+        "optional_files": ["city","placement","product","search_query"],
+    },
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MAIN APP
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -509,85 +598,162 @@ def main():
 
     # ── Sidebar ──────────────────────────────────────────────────────────────
     with st.sidebar:
-        st.markdown("### 📁 Upload Reports")
-        st.caption("Upload any combination of IM_* CSV files")
 
-        uploaded = st.file_uploader(
-            "Select CSV files", type=["csv", "xlsx"],
-            accept_multiple_files=True,
-            help="Supports: GRANULAR, DATE, SUMMARY, CITY, PLACEMENT, PRODUCT, SEARCH_QUERY"
+        # ── STEP 0: Report Frequency ─────────────────────────────────────
+        st.markdown("## 🔁 Report Frequency")
+        frequency = st.radio(
+            "How often are you reviewing?",
+            list(FREQUENCY_CONFIG.keys()),
+            format_func=lambda f: f"{FREQUENCY_CONFIG[f]['icon']} {f}",
+            index=0,
+            help="Controls which files are required/optional and which KPIs are highlighted."
+        )
+        fc = FREQUENCY_CONFIG[frequency]
+        st.markdown(
+            f'<div class="alert-blue" style="margin:0.4rem 0 0.8rem;">'
+            f'<b>{fc["icon"]} {frequency} focus:</b> {", ".join(fc["focus"])}<br>'
+            f'<small>{fc["description"]}</small></div>',
+            unsafe_allow_html=True
         )
 
         st.markdown("---")
-        st.markdown("### ⚙️ Thresholds")
+
+        # ── STEP 1: Individual file uploaders ────────────────────────────
+        st.markdown("## 📁 Upload Reports")
+
+        # Collect uploaded file objects keyed by slot
+        slot_files: dict[str, object] = {}
+
+        for slot in FILE_SLOTS:
+            # Only show slots relevant to the chosen frequency
+            if frequency not in slot["frequency"]:
+                continue
+
+            is_required = slot["key"] in fc["required_files"]
+            is_optional = slot["key"] in fc["optional_files"]
+
+            if not (is_required or is_optional):
+                continue  # skip if not applicable at all
+
+            badge = "🔴 Required" if is_required else "🟡 Optional"
+            label = f"{slot['label']}  ·  {badge}"
+
+            f = st.file_uploader(
+                label,
+                type=["csv","xlsx"],
+                key=f"upload_{slot['key']}",
+                help=f"Expected filename pattern: {slot['filename']}\n\n{slot['help']}",
+            )
+            slot_files[slot["key"]] = f
+
+        # ── Upload status checklist ──────────────────────────────────────
+        st.markdown("---")
+        st.markdown("### ✅ Upload Status")
+
+        all_required_ok = True
+        for slot in FILE_SLOTS:
+            if frequency not in slot["frequency"]:
+                continue
+            is_required = slot["key"] in fc["required_files"]
+            is_optional = slot["key"] in fc["optional_files"]
+            if not (is_required or is_optional):
+                continue
+
+            uploaded_file = slot_files.get(slot["key"])
+            if uploaded_file:
+                icon = "✅"
+                note = f"<span style='color:#66bb6a'>{uploaded_file.name[:28]}</span>"
+            elif is_required:
+                icon = "❌"
+                note = "<span style='color:#ef5350'>Missing — required</span>"
+                all_required_ok = False
+            else:
+                icon = "⬜"
+                note = "<span style='color:#888'>Not uploaded (optional)</span>"
+
+            st.markdown(
+                f"{icon} **{slot['label']}**<br>"
+                f"<small style='margin-left:1.4rem'>{note}</small>",
+                unsafe_allow_html=True
+            )
+
+        if not all_required_ok:
+            st.markdown(
+                '<div class="alert-yellow" style="margin-top:0.6rem">'
+                '⚠️ Upload all <b>required</b> files to enable full analysis.</div>',
+                unsafe_allow_html=True
+            )
+
+        st.markdown("---")
+
+        # ── STEP 2: Settings ──────────────────────────────────────────────
+        st.markdown("## ⚙️ Thresholds")
         roas_thresh = st.slider("Min ROAS target", 0.5, 5.0, 1.5, 0.1)
         cac_thresh  = st.slider("Max acceptable CAC (₹)", 50, 2000, 300, 50)
 
         st.markdown("---")
-        st.markdown("### 📅 Date Filter")
+        st.markdown("## 📅 Date Filter")
         date_filter = st.radio("Period", ["All time","Last 7 days","Last 30 days","Custom"], index=0)
         custom_start = custom_end = None
         if date_filter == "Custom":
             custom_start = st.date_input("From")
             custom_end   = st.date_input("To")
 
+    # ── Collect all uploaded files ────────────────────────────────────────────
+    # Build a flat list of (file_obj, detected_key) from named slots + auto-detect
+    uploaded_pairs: list[tuple] = []
+    for key, fobj in slot_files.items():
+        if fobj is not None:
+            uploaded_pairs.append((fobj, key))
+
+    # ── No files yet — show onboarding ───────────────────────────────────────
+    if not uploaded_pairs:
+        st.markdown(f"### {fc['icon']} {frequency} Report — Getting Started")
+
+        req_slots = [s for s in FILE_SLOTS if s["key"] in fc["required_files"] and frequency in s["frequency"]]
+        opt_slots = [s for s in FILE_SLOTS if s["key"] in fc["optional_files"] and frequency in s["frequency"]]
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("#### 🔴 Required files")
+            for s in req_slots:
+                st.markdown(f"""
+                <div class="alert-red" style="margin:0.3rem 0">
+                  <b>{s['label']}</b><br>
+                  <code style='font-size:0.75rem'>{s['filename']}</code><br>
+                  <small>{s['help']}</small>
+                </div>""", unsafe_allow_html=True)
+
+        with c2:
+            st.markdown("#### 🟡 Optional files")
+            for s in opt_slots:
+                st.markdown(f"""
+                <div class="alert-yellow" style="margin:0.3rem 0">
+                  <b>{s['label']}</b><br>
+                  <code style='font-size:0.75rem'>{s['filename']}</code><br>
+                  <small>{s['help']}</small>
+                </div>""", unsafe_allow_html=True)
+
         st.markdown("---")
-        st.info("💡 Tip: upload GRANULAR + DATE files together for the richest analysis.")
-
-    # ── No files yet ─────────────────────────────────────────────────────────
-    if not uploaded:
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.markdown("""
-            <div class="alert-blue">
-              <b>📂 Step 1 — Upload Files</b><br>
-              Use the sidebar uploader. Drop any IM_*.csv files.
-            </div>""", unsafe_allow_html=True)
-        with col2:
-            st.markdown("""
-            <div class="alert-blue">
-              <b>📊 Step 2 — Auto-Analysis</b><br>
-              KPIs, charts, and recommendations appear instantly.
-            </div>""", unsafe_allow_html=True)
-        with col3:
-            st.markdown("""
-            <div class="alert-blue">
-              <b>🎯 Step 3 — Take Action</b><br>
-              Follow budget suggestions and alerts.
-            </div>""", unsafe_allow_html=True)
-
-        st.markdown("#### Supported file types")
-        types = {
-            "IM_GRANULAR_*":       "Keyword × City × Day detail (most powerful)",
-            "IM_CAMPAIGN_X_DATE_*":"Daily campaign performance",
-            "IM_SUMMARY_*":        "Overall campaign summary",
-            "IM_CAMPAIGN_X_CITY_*":"City-level breakdown",
-            "IM_CAMPAIGN_X_PLACEMENT_*": "Placement / Ad-property analysis",
-            "IM_CAMPAIGN_X_PRODUCT_*":   "Product-level metrics",
-            "IM_CAMPAIGN_X_SEARCH_QUERY_*": "Search query analysis",
-        }
-        for k, v in types.items():
-            st.markdown(f"- **`{k}`** — {v}")
+        st.info("👈 Use the sidebar uploaders to add your files. Each report type has its own uploader so you can clearly see what's missing.")
         return
 
-    # ── Load and classify files ───────────────────────────────────────────────
+    # ── Load and standardize uploaded files ──────────────────────────────────
     datasets: dict[str, pd.DataFrame] = {}
     file_log = []
 
     with st.spinner("Loading and standardizing data …"):
-        for f in uploaded:
-            ftype = detect_file_type(f.name)
-            raw   = load_csv(f)
+        for fobj, ftype in uploaded_pairs:
+            raw = load_csv(fobj)
             if raw is None:
                 continue
             std = standardize(raw)
             std = learning_phase_flag(std)
-            # For duplicate types, append
             if ftype in datasets:
                 datasets[ftype] = pd.concat([datasets[ftype], std], ignore_index=True)
             else:
                 datasets[ftype] = std
-            file_log.append({"File": f.name, "Type": ftype,
+            file_log.append({"File": fobj.name, "Type": ftype,
                              "Rows": len(std), "Cols": len(std.columns)})
 
     if not datasets:
@@ -622,8 +788,49 @@ def main():
         st.warning("No data in selected date range. Try 'All time'.")
         return
 
+    # ── Frequency context banner ──────────────────────────────────────────────
+    missing_req = [s["label"] for s in FILE_SLOTS
+                   if s["key"] in fc["required_files"]
+                   and s["key"] not in datasets
+                   and frequency in s["frequency"]]
+    missing_opt = [s["label"] for s in FILE_SLOTS
+                   if s["key"] in fc["optional_files"]
+                   and s["key"] not in datasets
+                   and frequency in s["frequency"]]
+
+    banner_cols = st.columns([3,2])
+    with banner_cols[0]:
+        loaded_types = ", ".join(f"`{k}`" for k in datasets.keys())
+        st.markdown(
+            f'<div class="alert-green">'
+            f'<b>{fc["icon"]} {frequency} Review Mode</b> — '
+            f'Loaded: {loaded_types}<br>'
+            f'<small>KPI focus: {" · ".join(fc["focus"])}</small>'
+            f'</div>', unsafe_allow_html=True
+        )
+    with banner_cols[1]:
+        if missing_req:
+            st.markdown(
+                f'<div class="alert-red">'
+                f'<b>Missing required files:</b><br>'
+                + "<br>".join(f"❌ {m}" for m in missing_req) +
+                f'</div>', unsafe_allow_html=True
+            )
+        elif missing_opt:
+            st.markdown(
+                f'<div class="alert-yellow">'
+                f'<b>Optional files not uploaded:</b><br>'
+                + "<br>".join(f"⬜ {m}" for m in missing_opt) +
+                f'</div>', unsafe_allow_html=True
+            )
+        else:
+            st.markdown(
+                '<div class="alert-green"><b>✅ All recommended files loaded!</b></div>',
+                unsafe_allow_html=True
+            )
+
     # ── Uploaded file summary ─────────────────────────────────────────────────
-    with st.expander("📋 Uploaded files summary", expanded=False):
+    with st.expander("📋 Uploaded files detail", expanded=False):
         st.dataframe(pd.DataFrame(file_log), use_container_width=True, hide_index=True)
 
     # ── KPI CARDS ─────────────────────────────────────────────────────────────
