@@ -157,19 +157,28 @@ DIM_COLS = [
 
 @st.cache_resource(show_spinner=False)
 def _get_db_pool():
-    """Create a connection pool (cached across sessions via @cache_resource).
-    Compatible with both Neon PostgreSQL (sslmode=require) and
-    CockroachDB (sslmode=verify-full).
+    """Create a connection pool compatible with Neon PostgreSQL and CockroachDB.
+
+    CockroachDB with sslmode=verify-full requires a root certificate.
+    Streamlit Cloud doesn't have ~/.postgresql/root.crt, so we inject
+    sslrootcert=system which tells psycopg2 to use the OS trusted CA bundle
+    instead — this works on Streamlit Cloud's Linux environment.
     """
     try:
         conn_str = st.secrets.get("DATABASE_URL", "")
         if not conn_str:
             return None
-        # CockroachDB needs application_name set and prefers keepalives
+
+        # ── Patch sslrootcert=system for CockroachDB on Streamlit Cloud ──────
+        # Only needed when sslmode=verify-full (CockroachDB default).
+        # Neon uses sslmode=require which doesn't need this.
+        if "verify-full" in conn_str and "sslrootcert" not in conn_str:
+            conn_str = conn_str + "&sslrootcert=system"
+
         p = pg_pool.SimpleConnectionPool(
             1, 5, conn_str,
             application_name="campaign_dashboard",
-            connect_timeout=10,
+            connect_timeout=15,
         )
         return p
     except Exception as e:
