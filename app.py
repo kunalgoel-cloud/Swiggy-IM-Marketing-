@@ -1484,42 +1484,10 @@ def main():
         if fobj is not None:
             uploaded_pairs.append((fobj, key))
 
-    # ── No files yet — show onboarding ───────────────────────────────────────
-    has_stored = DataStore.total_rows() > 0
-    if not uploaded_pairs and not has_stored:
-        st.markdown(f"### {fc['icon']} {frequency} Report — Getting Started")
-
-        req_slots = [s for s in FILE_SLOTS if s["key"] in fc["required_files"] and frequency in s["frequency"]]
-        opt_slots = [s for s in FILE_SLOTS if s["key"] in fc["optional_files"] and frequency in s["frequency"]]
-
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("#### 🔴 Required files")
-            for s in req_slots:
-                st.markdown(f"""
-                <div class="alert-red" style="margin:0.3rem 0">
-                  <b>{s['label']}</b><br>
-                  <code style='font-size:0.75rem'>{s['filename']}</code><br>
-                  <small>{s['help']}</small>
-                </div>""", unsafe_allow_html=True)
-
-        with c2:
-            st.markdown("#### 🟡 Optional files")
-            for s in opt_slots:
-                st.markdown(f"""
-                <div class="alert-yellow" style="margin:0.3rem 0">
-                  <b>{s['label']}</b><br>
-                  <code style='font-size:0.75rem'>{s['filename']}</code><br>
-                  <small>{s['help']}</small>
-                </div>""", unsafe_allow_html=True)
-
-        st.markdown("---")
-        st.info("👈 Use the sidebar uploaders to add your files. Each report type has its own uploader so you can clearly see what's missing.")
-        return
-
     # ── Upsert newly uploaded files into DataStore ────────────────────────────
     if uploaded_pairs:
         upsert_log = []
+        newly_added = 0
         with st.spinner("Loading, deduplicating and storing data …"):
             for fobj, ftype in uploaded_pairs:
                 raw = load_csv(fobj)
@@ -1528,6 +1496,7 @@ def main():
                 std = standardize(raw)
                 std = learning_phase_flag(std)
                 added, skipped = DataStore.upsert(ftype, std)
+                newly_added += added
                 upsert_log.append({
                     "File": fobj.name, "Type": ftype,
                     "New rows added": added, "Duplicate rows skipped": skipped
@@ -1543,10 +1512,8 @@ def main():
                         st.markdown(
                             '<div class="alert-red">'
                             '<b>⚠️ All rows skipped but database appears empty!</b><br>'
-                            'This usually means you recently switched databases (e.g. Neon → CockroachDB). '
-                            'The dedup hashes are computed fresh from the CSV — if the new DB is empty, '
-                            'rows should have been inserted. Try clicking <b>🗑️ Clear all stored data</b> '
-                            'in the sidebar and re-uploading.'
+                            'This usually means you recently switched databases. '
+                            'Try clicking <b>🗑️ Clear all stored data</b> in the sidebar and re-uploading.'
                             '</div>', unsafe_allow_html=True
                         )
                     else:
@@ -1556,6 +1523,39 @@ def main():
                             f'No duplicates inserted — this is correct behaviour.'
                             f'</div>', unsafe_allow_html=True
                         )
+
+        # ── Rerun after inserting new rows so dashboard loads fresh ───────────
+        if newly_added > 0:
+            st.rerun()
+
+    # ── Show onboarding if DB still empty and nothing uploaded ────────────────
+    has_stored = DataStore.total_rows() > 0
+    if not has_stored:
+        st.markdown(f"### {fc['icon']} {frequency} Report — Getting Started")
+        req_slots = [s for s in FILE_SLOTS if s["key"] in fc["required_files"] and frequency in s["frequency"]]
+        opt_slots = [s for s in FILE_SLOTS if s["key"] in fc["optional_files"] and frequency in s["frequency"]]
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("#### 🔴 Required files")
+            for s in req_slots:
+                st.markdown(f"""
+                <div class="alert-red" style="margin:0.3rem 0">
+                  <b>{s['label']}</b><br>
+                  <code style='font-size:0.75rem'>{s['filename']}</code><br>
+                  <small>{s['help']}</small>
+                </div>""", unsafe_allow_html=True)
+        with c2:
+            st.markdown("#### 🟡 Optional files")
+            for s in opt_slots:
+                st.markdown(f"""
+                <div class="alert-yellow" style="margin:0.3rem 0">
+                  <b>{s['label']}</b><br>
+                  <code style='font-size:0.75rem'>{s['filename']}</code><br>
+                  <small>{s['help']}</small>
+                </div>""", unsafe_allow_html=True)
+        st.markdown("---")
+        st.info("👈 Use the sidebar uploaders to add your files. Each report type has its own uploader so you can clearly see what's missing.")
+        return
 
     # ── Resolve date bounds for DB query ──────────────────────────────────────
     today = pd.Timestamp.today()
