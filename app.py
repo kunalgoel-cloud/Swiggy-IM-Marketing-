@@ -155,25 +155,58 @@ DIM_COLS = [
 ]
 
 
+def _write_cockroach_cert() -> str | None:
+    """
+    If COCKROACH_CERT secret exists (base64-encoded root.crt),
+    decode it and write to /tmp/cockroach-root.crt.
+    Returns the file path, or None if secret not found.
+    """
+    cert_b64 = st.secrets.get("COCKROACH_CERT", "")
+    if not cert_b64:
+        return None
+    import base64, re
+    # Strip any whitespace / newlines that may appear in the secret value
+    cert_b64_clean = re.sub(r"\s+", "", cert_b64.strip())
+    cert_bytes = base64.b64decode(cert_b64_clean)
+    cert_path  = "/tmp/cockroach-root.crt"
+    with open(cert_path, "wb") as f:
+        f.write(cert_bytes)
+    return cert_path
+
+
 @st.cache_resource(show_spinner=False)
 def _get_db_pool():
-    """Create a connection pool compatible with Neon PostgreSQL and CockroachDB.
+    """
+    Create a connection pool. Supports:
+      • Neon PostgreSQL  (sslmode=require  — no cert needed)
+      • CockroachDB      (sslmode=verify-full + cert written from secret)
 
-    CockroachDB with sslmode=verify-full requires a root certificate.
-    Streamlit Cloud doesn't have ~/.postgresql/root.crt, so we inject
-    sslrootcert=system which tells psycopg2 to use the OS trusted CA bundle
-    instead — this works on Streamlit Cloud's Linux environment.
+    SSL resolution order for CockroachDB:
+      1. COCKROACH_CERT secret present → decode, write to /tmp, use verify-full
+      2. No cert secret               → fall back to sslmode=require (still encrypted)
     """
     try:
         conn_str = st.secrets.get("DATABASE_URL", "")
         if not conn_str:
             return None
 
-        # ── Patch sslrootcert=system for CockroachDB on Streamlit Cloud ──────
-        # Only needed when sslmode=verify-full (CockroachDB default).
-        # Neon uses sslmode=require which doesn't need this.
-        if "verify-full" in conn_str and "sslrootcert" not in conn_str:
-            conn_str = conn_str + "&sslrootcert=system"
+        if "cockroachlabs.cloud" in conn_str:
+            import re
+
+            # Remove any existing ssl params so we can set them cleanly
+            conn_str = re.sub(r"[?&]sslmode=[^&]*",     "", conn_str)
+            conn_str = re.sub(r"[?&]sslrootcert=[^&]*", "", conn_str)
+
+            cert_path = _write_cockroach_cert()
+
+            if cert_path:
+                # Full cert verification — most secure
+                sep = "&" if "?" in conn_str else "?"
+                conn_str = f"{conn_str}{sep}sslmode=verify-full&sslrootcert={cert_path}"
+            else:
+                # Encrypted but no cert verification — still safe for transit
+                sep = "&" if "?" in conn_str else "?"
+                conn_str = f"{conn_str}{sep}sslmode=require"
 
         p = pg_pool.SimpleConnectionPool(
             1, 5, conn_str,
@@ -181,6 +214,7 @@ def _get_db_pool():
             connect_timeout=15,
         )
         return p
+
     except Exception as e:
         st.warning(f"⚠️ DB pool init failed: {e}")
         return None
