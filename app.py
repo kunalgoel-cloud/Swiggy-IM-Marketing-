@@ -15,6 +15,7 @@ import io
 import hashlib
 import json
 import psycopg2
+from psycopg2.extras import execute_values
 from psycopg2 import pool as pg_pool
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -540,10 +541,9 @@ class DataStore:
                 except Exception:
                     return None
 
-            # ── Fast bulk insert using pandas + SQLAlchemy ───────────────────
-            # iterrows() + mogrify is too slow for large files (38k rows).
-            # Instead: build a clean DataFrame of only new rows and use
-            # pandas to_sql with method='multi' for fast bulk inserts.
+            # ── Fast bulk insert using psycopg2 execute_values ───────────────
+            # Builds a clean DataFrame of only new rows, then inserts in
+            # efficient batches using execute_values (single round-trip per batch).
 
             DB_COLS = [
                 "file_type","row_hash","date","campaign_id","campaign","status",
@@ -553,92 +553,63 @@ class DataStore:
                 "a2c","ecpm","ecpc","direct_gmv7","direct_roi7",
             ]
 
-            # Build insert DataFrame with correct column names
+            # Build insert DataFrame
             insert_df = to_insert.copy()
             insert_df["file_type"] = ftype
             insert_df["row_hash"]  = insert_df["_hash"]
 
-            # Keep only DB columns that exist; fill missing with None
+            # Fill missing columns with None
             for col in DB_COLS:
                 if col not in insert_df.columns:
                     insert_df[col] = None
 
             insert_df = insert_df[DB_COLS].copy()
 
-            # Coerce date columns
+            # Coerce date columns to Python date objects
             for dc in ["date", "start_date"]:
                 if dc in insert_df.columns:
-                    insert_df[dc] = pd.to_datetime(insert_df[dc], errors="coerce").dt.date
+                    insert_df[dc] = pd.to_datetime(
+                        insert_df[dc], errors="coerce"
+                    ).dt.date.where(insert_df[dc].notna(), other=None)
 
-            # Coerce numeric columns to proper Python types
-            int_cols   = ["clicks","impressions","orders","a2c"]
-            float_cols = ["spend","revenue","budget","ecpm","ecpc","direct_gmv7","direct_roi7"]
-            for c in int_cols:
-                insert_df[c] = pd.to_numeric(insert_df[c], errors="coerce").where(
-                    insert_df[c].notna(), other=None)
-            for c in float_cols:
-                insert_df[c] = pd.to_numeric(insert_df[c], errors="coerce").where(
-                    insert_df[c].notna(), other=None)
+            # Coerce numerics — NaN → None so psycopg2 sends NULL
+            for c in ["clicks","impressions","orders","a2c"]:
+                if c in insert_df.columns:
+                    insert_df[c] = pd.to_numeric(insert_df[c], errors="coerce")
+                    insert_df[c] = insert_df[c].where(insert_df[c].notna(), other=None)
+            for c in ["spend","revenue","budget","ecpm","ecpc","direct_gmv7","direct_roi7"]:
+                if c in insert_df.columns:
+                    insert_df[c] = pd.to_numeric(insert_df[c], errors="coerce")
+                    insert_df[c] = insert_df[c].where(insert_df[c].notna(), other=None)
 
-            # Truncate long text fields
+            # Truncate long text columns
             for c in ["keyword","search_query","campaign","product","city","placement"]:
                 if c in insert_df.columns:
-                    insert_df[c] = insert_df[c].astype(str).str[:512].where(
-                        insert_df[c].notna(), other=None)
-
-            # Use SQLAlchemy for fast bulk insert (avoids mogrify loop)
-            try:
-                from sqlalchemy import create_engine, text
-                import re as _re
-
-                raw_url = st.secrets.get("DATABASE_URL","")
-                # Convert psycopg2 URL to SQLAlchemy format
-                sa_url = raw_url.replace("postgresql://","postgresql+psycopg2://")
-
-                # Handle CockroachDB SSL cert for SQLAlchemy
-                cert_path = _write_cockroach_cert()
-                if cert_path and "sslrootcert" not in sa_url:
-                    sep = "&" if "?" in sa_url else "?"
-                    sa_url = f"{sa_url}{sep}sslrootcert={cert_path}"
-                # Remove verify-full for sqlalchemy — use require instead
-                sa_url = _re.sub(r"sslmode=verify-full","sslmode=require", sa_url)
-                sa_url = _re.sub(r"channel_binding=[^&]*","", sa_url)
-                sa_url = _re.sub(r"&&","&", sa_url).rstrip("&?")
-
-                engine = create_engine(sa_url, connect_args={"connect_timeout": 30})
-
-                BATCH = 500
-                committed = 0
-                for i in range(0, len(insert_df), BATCH):
-                    chunk = insert_df.iloc[i:i+BATCH]
-                    chunk.to_sql(
-                        "campaign_data",
-                        engine,
-                        if_exists="append",
-                        index=False,
-                        method="multi",
+                    insert_df[c] = insert_df[c].astype(str).str[:512]
+                    insert_df[c] = insert_df[c].where(
+                        insert_df[c].notna() & (insert_df[c] != "nan"), other=None
                     )
-                    committed += len(chunk)
 
-                engine.dispose()
+            # Convert to list of tuples — fast vectorised operation
+            rows = list(insert_df.itertuples(index=False, name=None))
 
-            except Exception as sa_err:
-                # SQLAlchemy failed — fall back to psycopg2 executemany in small batches
-                st.warning(f"SQLAlchemy insert failed ({sa_err}), using fallback…")
-                insert_sql = """INSERT INTO campaign_data
+            insert_sql = """
+                INSERT INTO campaign_data
                     (file_type,row_hash,date,campaign_id,campaign,status,
                      keyword,city,placement,product,search_query,brand,
                      start_date,match_type,bidding,phase,
                      spend,revenue,clicks,impressions,orders,budget,
                      a2c,ecpm,ecpc,direct_gmv7,direct_roi7)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                            %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT (file_type,row_hash) DO NOTHING;"""
-                rows = [tuple(r) for r in insert_df.itertuples(index=False, name=None)]
-                BATCH = 100
-                for i in range(0, len(rows), BATCH):
-                    cur.executemany(insert_sql, rows[i:i+BATCH])
-                    conn.commit()
+                VALUES %s
+                ON CONFLICT (file_type,row_hash) DO NOTHING;
+            """
+
+            from psycopg2.extras import execute_values as _ev
+
+            BATCH = 500
+            for i in range(0, len(rows), BATCH):
+                _ev(cur, insert_sql, rows[i:i+BATCH], page_size=BATCH)
+                conn.commit()
 
             return added, skipped
 
