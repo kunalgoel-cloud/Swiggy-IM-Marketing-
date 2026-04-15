@@ -165,13 +165,26 @@ def _write_cockroach_cert() -> str | None:
     if not cert_b64:
         return None
     import base64, re
-    # Strip any whitespace / newlines that may appear in the secret value
     cert_b64_clean = re.sub(r"\s+", "", cert_b64.strip())
     cert_bytes = base64.b64decode(cert_b64_clean)
     cert_path  = "/tmp/cockroach-root.crt"
     with open(cert_path, "wb") as f:
         f.write(cert_bytes)
     return cert_path
+
+
+def _db_url_changed() -> bool:
+    """
+    Detect if DATABASE_URL has changed since the pool was created.
+    If yes, clear the cache so a fresh pool is built with the new URL.
+    """
+    current_url = st.secrets.get("DATABASE_URL", "")
+    cached_url  = st.session_state.get("_cached_db_url", "")
+    if current_url != cached_url:
+        st.session_state["_cached_db_url"] = current_url
+        _get_db_pool.clear()   # force @st.cache_resource to rebuild
+        return True
+    return False
 
 
 @st.cache_resource(show_spinner=False)
@@ -487,14 +500,16 @@ class DataStore:
         try:
             cur = conn.cursor()
 
-            # 1. Fetch existing hashes for this file_type
+            # ── Always query the ACTUAL connected DB for existing hashes ──────
+            # Never use session-state cache here — if DB changed (e.g. migrated
+            # from Neon to CockroachDB), session state hashes are stale/wrong.
             cur.execute(
                 "SELECT row_hash FROM campaign_data WHERE file_type = %s;",
                 (ftype,)
             )
             existing_hashes = {r[0] for r in cur.fetchall()}
 
-            # 2. Filter to only new rows
+            # Filter to only genuinely new rows vs THIS database
             mask_new  = ~new_df["_hash"].isin(existing_hashes)
             to_insert = new_df[mask_new]
             added     = len(to_insert)
@@ -660,7 +675,12 @@ class DataStore:
     def db_status(cls) -> str:
         """Return a human-readable DB connection status string."""
         if cls._db_ok():
-            return "🟢 PostgreSQL (Neon)"
+            raw_url = st.secrets.get("DATABASE_URL", "")
+            if "cockroachlabs" in raw_url:
+                return "🟢 CockroachDB"
+            elif "neon.tech" in raw_url:
+                return "🟢 PostgreSQL (Neon)"
+            return "🟢 PostgreSQL"
         return "🟡 Session state (DB unavailable)"
 
 
@@ -1269,6 +1289,11 @@ FREQUENCY_CONFIG = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
+    # ── Detect DB URL change and bust cache if needed ────────────────────────
+    # This handles the case where DATABASE_URL is updated in secrets while
+    # @st.cache_resource still holds an old connection pool.
+    _db_url_changed()
+
     # ── Header ──────────────────────────────────────────────────────────────
     st.markdown("""
     <div class="dash-header">
@@ -1377,12 +1402,29 @@ def main():
         # ── STEP 3: Database summary + date filter ────────────────────────
         st.markdown("## 🗄️ Data Store")
 
-        # Show connection status
+        # ── Live connection diagnostic ────────────────────────────────────
         db_status_str = DataStore.db_status()
-        status_color  = "alert-green" if "PostgreSQL" in db_status_str else "alert-yellow"
+        status_color  = "alert-green" if "PostgreSQL" in db_status_str or "CockroachDB" in db_status_str else "alert-yellow"
+
+        # Show which host we're actually connected to
+        raw_url = st.secrets.get("DATABASE_URL", "")
+        if raw_url:
+            try:
+                from urllib.parse import urlparse
+                parsed   = urlparse(raw_url)
+                db_host  = parsed.hostname or "unknown"
+                db_name  = parsed.path.lstrip("/") or "unknown"
+                db_label = f"{db_host[:45]}/{db_name}"
+            except Exception:
+                db_label = "configured"
+        else:
+            db_label = "not configured"
+
         st.markdown(
             f'<div class="{status_color}" style="margin-bottom:0.5rem">'
-            f'<b>Storage:</b> {db_status_str}</div>',
+            f'<b>Storage:</b> {db_status_str}<br>'
+            f'<small style="word-break:break-all">🔌 {db_label}</small>'
+            f'</div>',
             unsafe_allow_html=True
         )
 
@@ -1400,9 +1442,21 @@ def main():
                 st.dataframe(DataStore.summary(), use_container_width=True, hide_index=True)
             if st.button("🗑️ Clear all stored data", use_container_width=True):
                 DataStore.clear()
+                # Also wipe session-state fallback so next upload
+                # recomputes hashes against the freshly cleared DB
+                for k in list(st.session_state.keys()):
+                    if k.startswith("_ds_"):
+                        del st.session_state[k]
                 st.rerun()
         else:
-            st.caption("No data stored yet. Upload files above.")
+            st.markdown(
+                '<div class="alert-yellow">'
+                '⚠️ <b>No data in this database yet.</b><br>'
+                '<small>Upload your CSV files above to populate it. '
+                'If you just switched databases, upload the same files again — '
+                'the app will insert them fresh into the new DB.</small>'
+                '</div>', unsafe_allow_html=True
+            )
 
         st.markdown("---")
         st.markdown("## 📅 Date Filter")
@@ -1480,8 +1534,28 @@ def main():
                 })
 
         if upsert_log:
+            all_skipped = all(r["New rows added"] == 0 for r in upsert_log)
             with st.expander("📥 Upload result", expanded=True):
                 st.dataframe(pd.DataFrame(upsert_log), use_container_width=True, hide_index=True)
+                if all_skipped:
+                    db_rows = DataStore.total_rows()
+                    if db_rows == 0:
+                        st.markdown(
+                            '<div class="alert-red">'
+                            '<b>⚠️ All rows skipped but database appears empty!</b><br>'
+                            'This usually means you recently switched databases (e.g. Neon → CockroachDB). '
+                            'The dedup hashes are computed fresh from the CSV — if the new DB is empty, '
+                            'rows should have been inserted. Try clicking <b>🗑️ Clear all stored data</b> '
+                            'in the sidebar and re-uploading.'
+                            '</div>', unsafe_allow_html=True
+                        )
+                    else:
+                        st.markdown(
+                            f'<div class="alert-blue">'
+                            f'ℹ️ All rows already exist in the database ({db_rows:,} rows stored). '
+                            f'No duplicates inserted — this is correct behaviour.'
+                            f'</div>', unsafe_allow_html=True
+                        )
 
     # ── Resolve date bounds for DB query ──────────────────────────────────────
     today = pd.Timestamp.today()
