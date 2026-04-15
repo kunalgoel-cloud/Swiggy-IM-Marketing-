@@ -540,62 +540,105 @@ class DataStore:
                 except Exception:
                     return None
 
-            records = []
-            for _, row in to_insert.iterrows():
-                records.append((
-                    ftype,
-                    row["_hash"],
-                    _safe(row.get("date"),       "date"),
-                    _safe(row.get("campaign_id")),
-                    _safe(row.get("campaign")),
-                    _safe(row.get("status")),
-                    _safe(row.get("keyword")),
-                    _safe(row.get("city")),
-                    _safe(row.get("placement")),
-                    _safe(row.get("product")),
-                    _safe(row.get("search_query")),
-                    _safe(row.get("brand")),
-                    _safe(row.get("start_date"),  "date"),
-                    _safe(row.get("match_type")),
-                    _safe(row.get("bidding")),
-                    _safe(row.get("phase")),
-                    _safe(row.get("spend"),       "float"),
-                    _safe(row.get("revenue"),     "float"),
-                    _safe(row.get("clicks"),      "int"),
-                    _safe(row.get("impressions"), "int"),
-                    _safe(row.get("orders"),      "int"),
-                    _safe(row.get("budget"),      "float"),
-                    _safe(row.get("a2c"),         "int"),
-                    _safe(row.get("ecpm"),        "float"),
-                    _safe(row.get("ecpc"),        "float"),
-                    _safe(row.get("direct_gmv7"), "float"),
-                    _safe(row.get("direct_roi7"), "float"),
-                ))
+            # ── Fast bulk insert using pandas + SQLAlchemy ───────────────────
+            # iterrows() + mogrify is too slow for large files (38k rows).
+            # Instead: build a clean DataFrame of only new rows and use
+            # pandas to_sql with method='multi' for fast bulk inserts.
 
-            # Use VALUES (...),(...) bulk insert — much faster than executemany
-            # and works reliably on both CockroachDB and PostgreSQL
-            insert_cols = """(file_type, row_hash, date, campaign_id, campaign, status,
-                    keyword, city, placement, product, search_query, brand,
-                    start_date, match_type, bidding, phase,
-                    spend, revenue, clicks, impressions, orders, budget,
-                    a2c, ecpm, ecpc, direct_gmv7, direct_roi7)"""
+            DB_COLS = [
+                "file_type","row_hash","date","campaign_id","campaign","status",
+                "keyword","city","placement","product","search_query","brand",
+                "start_date","match_type","bidding","phase",
+                "spend","revenue","clicks","impressions","orders","budget",
+                "a2c","ecpm","ecpc","direct_gmv7","direct_roi7",
+            ]
 
-            BATCH = 200  # smaller batch = more reliable on CockroachDB
-            total_committed = 0
-            for i in range(0, len(records), BATCH):
-                batch = records[i:i+BATCH]
-                # Build VALUES clause manually — safe because all values go
-                # through psycopg2 parameter binding per row
-                placeholders = ",".join(
-                    cur.mogrify("(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", r).decode()
-                    for r in batch
-                )
-                cur.execute(
-                    f"INSERT INTO campaign_data {insert_cols} VALUES {placeholders} "
-                    f"ON CONFLICT (file_type, row_hash) DO NOTHING;"
-                )
-                conn.commit()
-                total_committed += len(batch)
+            # Build insert DataFrame with correct column names
+            insert_df = to_insert.copy()
+            insert_df["file_type"] = ftype
+            insert_df["row_hash"]  = insert_df["_hash"]
+
+            # Keep only DB columns that exist; fill missing with None
+            for col in DB_COLS:
+                if col not in insert_df.columns:
+                    insert_df[col] = None
+
+            insert_df = insert_df[DB_COLS].copy()
+
+            # Coerce date columns
+            for dc in ["date", "start_date"]:
+                if dc in insert_df.columns:
+                    insert_df[dc] = pd.to_datetime(insert_df[dc], errors="coerce").dt.date
+
+            # Coerce numeric columns to proper Python types
+            int_cols   = ["clicks","impressions","orders","a2c"]
+            float_cols = ["spend","revenue","budget","ecpm","ecpc","direct_gmv7","direct_roi7"]
+            for c in int_cols:
+                insert_df[c] = pd.to_numeric(insert_df[c], errors="coerce").where(
+                    insert_df[c].notna(), other=None)
+            for c in float_cols:
+                insert_df[c] = pd.to_numeric(insert_df[c], errors="coerce").where(
+                    insert_df[c].notna(), other=None)
+
+            # Truncate long text fields
+            for c in ["keyword","search_query","campaign","product","city","placement"]:
+                if c in insert_df.columns:
+                    insert_df[c] = insert_df[c].astype(str).str[:512].where(
+                        insert_df[c].notna(), other=None)
+
+            # Use SQLAlchemy for fast bulk insert (avoids mogrify loop)
+            try:
+                from sqlalchemy import create_engine, text
+                import re as _re
+
+                raw_url = st.secrets.get("DATABASE_URL","")
+                # Convert psycopg2 URL to SQLAlchemy format
+                sa_url = raw_url.replace("postgresql://","postgresql+psycopg2://")
+
+                # Handle CockroachDB SSL cert for SQLAlchemy
+                cert_path = _write_cockroach_cert()
+                if cert_path and "sslrootcert" not in sa_url:
+                    sep = "&" if "?" in sa_url else "?"
+                    sa_url = f"{sa_url}{sep}sslrootcert={cert_path}"
+                # Remove verify-full for sqlalchemy — use require instead
+                sa_url = _re.sub(r"sslmode=verify-full","sslmode=require", sa_url)
+                sa_url = _re.sub(r"channel_binding=[^&]*","", sa_url)
+                sa_url = _re.sub(r"&&","&", sa_url).rstrip("&?")
+
+                engine = create_engine(sa_url, connect_args={"connect_timeout": 30})
+
+                BATCH = 500
+                committed = 0
+                for i in range(0, len(insert_df), BATCH):
+                    chunk = insert_df.iloc[i:i+BATCH]
+                    chunk.to_sql(
+                        "campaign_data",
+                        engine,
+                        if_exists="append",
+                        index=False,
+                        method="multi",
+                    )
+                    committed += len(chunk)
+
+                engine.dispose()
+
+            except Exception as sa_err:
+                # SQLAlchemy failed — fall back to psycopg2 executemany in small batches
+                st.warning(f"SQLAlchemy insert failed ({sa_err}), using fallback…")
+                insert_sql = """INSERT INTO campaign_data
+                    (file_type,row_hash,date,campaign_id,campaign,status,
+                     keyword,city,placement,product,search_query,brand,
+                     start_date,match_type,bidding,phase,
+                     spend,revenue,clicks,impressions,orders,budget,
+                     a2c,ecpm,ecpc,direct_gmv7,direct_roi7)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                            %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (file_type,row_hash) DO NOTHING;"""
+                rows = [tuple(r) for r in insert_df.itertuples(index=False, name=None)]
+                BATCH = 100
+                for i in range(0, len(rows), BATCH):
+                    cur.executemany(insert_sql, rows[i:i+BATCH])
+                    conn.commit()
 
             return added, skipped
 
@@ -1521,19 +1564,32 @@ def main():
     if uploaded_pairs:
         upsert_log = []
         newly_added = 0
-        with st.spinner("Loading, deduplicating and storing data …"):
-            for fobj, ftype in uploaded_pairs:
-                raw = load_csv(fobj)
-                if raw is None:
-                    continue
-                std = standardize(raw)
-                std = learning_phase_flag(std)
-                added, skipped = DataStore.upsert(ftype, std)
-                newly_added += added
-                upsert_log.append({
-                    "File": fobj.name, "Type": ftype,
-                    "New rows added": added, "Duplicate rows skipped": skipped
-                })
+        progress_bar = st.progress(0, text="Starting upload…")
+        total_files  = len(uploaded_pairs)
+
+        for idx, (fobj, ftype) in enumerate(uploaded_pairs):
+            pct  = int(idx / total_files * 100)
+            progress_bar.progress(pct, text=f"Processing {fobj.name[:40]} ({idx+1}/{total_files})…")
+
+            raw = load_csv(fobj)
+            if raw is None:
+                continue
+            std = standardize(raw)
+            std = learning_phase_flag(std)
+
+            progress_bar.progress(pct + int(1/total_files*50),
+                                  text=f"Saving {fobj.name[:40]} to database…")
+
+            added, skipped = DataStore.upsert(ftype, std)
+            newly_added += added
+            upsert_log.append({
+                "File": fobj.name, "Type": ftype,
+                "New rows added": added, "Duplicate rows skipped": skipped
+            })
+
+        progress_bar.progress(100, text="✅ Done!")
+        import time; time.sleep(0.5)
+        progress_bar.empty()
 
         if upsert_log:
             all_skipped = all(r["New rows added"] == 0 for r in upsert_log)
