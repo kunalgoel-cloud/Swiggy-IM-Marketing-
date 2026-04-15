@@ -253,14 +253,16 @@ def _release(conn):
 
 
 def _init_schema():
-    """Create tables and indexes. Compatible with both PostgreSQL (Neon) and CockroachDB."""
+    """Create tables and indexes. Compatible with both PostgreSQL (Neon) and CockroachDB.
+    Stores success/failure in session state so the UI can show DB health status.
+    """
     conn = _get_conn()
     if conn is None:
+        st.session_state["_schema_status"] = "no_connection"
         return
+
     try:
         cur = conn.cursor()
-        # Main data table — one row per granular record
-        # BIGSERIAL works on both Neon PostgreSQL and CockroachDB
         cur.execute("""
             CREATE TABLE IF NOT EXISTS campaign_data (
                 id              BIGSERIAL PRIMARY KEY,
@@ -296,7 +298,7 @@ def _init_schema():
             );
         """)
         conn.commit()
-        # CockroachDB requires separate statements per CREATE INDEX
+
         for idx_sql in [
             "CREATE INDEX IF NOT EXISTS idx_cd_date     ON campaign_data (date);",
             "CREATE INDEX IF NOT EXISTS idx_cd_filetype ON campaign_data (file_type);",
@@ -305,10 +307,17 @@ def _init_schema():
                 cur.execute(idx_sql)
                 conn.commit()
             except Exception:
-                conn.rollback()   # index may already exist — safe to ignore
+                conn.rollback()
+
+        # Verify table is actually queryable
+        cur.execute("SELECT COUNT(*) FROM campaign_data;")
+        row_count = cur.fetchone()[0]
+        st.session_state["_schema_status"] = "ok"
+        st.session_state["_db_row_count"]  = int(row_count)
+
     except Exception as e:
         conn.rollback()
-        st.warning(f"Schema init warning: {e}")
+        st.session_state["_schema_status"] = f"error: {e}"
     finally:
         _release(conn)
 
@@ -1431,30 +1440,46 @@ def main():
         total_rows = DataStore.total_rows()
         db_min, db_max = DataStore.date_range()
 
-        if total_rows > 0:
+        # Show schema health
+        schema_status = st.session_state.get("_schema_status", "unknown")
+        if schema_status == "ok":
             st.markdown(
                 f'<div class="alert-blue">'
                 f'<b>📦 {total_rows:,} rows stored</b><br>'
                 f'<small>Date range: {db_min.date() if db_min else "—"} → {db_max.date() if db_max else "—"}</small>'
                 f'</div>', unsafe_allow_html=True
             )
+        elif schema_status == "no_connection":
+            st.markdown(
+                '<div class="alert-red"><b>❌ Cannot connect to database</b><br>'
+                '<small>Check DATABASE_URL secret and COCKROACH_CERT.</small></div>',
+                unsafe_allow_html=True
+            )
+        elif schema_status.startswith("error:"):
+            st.markdown(
+                f'<div class="alert-red"><b>❌ Schema error</b><br>'
+                f'<small>{schema_status}</small></div>',
+                unsafe_allow_html=True
+            )
+        else:
+            st.caption("Checking database…")
+
+        if total_rows > 0:
             with st.expander("📋 Store contents", expanded=False):
                 st.dataframe(DataStore.summary(), use_container_width=True, hide_index=True)
             if st.button("🗑️ Clear all stored data", use_container_width=True):
                 DataStore.clear()
-                # Also wipe session-state fallback so next upload
-                # recomputes hashes against the freshly cleared DB
                 for k in list(st.session_state.keys()):
-                    if k.startswith("_ds_"):
+                    if k.startswith("_ds_") or k in ("_schema_status","_db_row_count"):
                         del st.session_state[k]
                 st.rerun()
-        else:
+        elif schema_status == "ok":
             st.markdown(
                 '<div class="alert-yellow">'
                 '⚠️ <b>No data in this database yet.</b><br>'
-                '<small>Upload your CSV files above to populate it. '
+                '<small>Upload your CSV files above. '
                 'If you just switched databases, upload the same files again — '
-                'the app will insert them fresh into the new DB.</small>'
+                'they will insert fresh into the new DB.</small>'
                 '</div>', unsafe_allow_html=True
             )
 
