@@ -518,20 +518,18 @@ class DataStore:
             if added == 0:
                 return 0, skipped
 
-            # 3. Build insert rows — map DataFrame cols to DB cols
+            # 3. Build insert rows
             def _safe(val, cast=None):
-                if pd.isna(val) if not isinstance(val, str) else val == "":
+                try:
+                    if val is None: return None
+                    if isinstance(val, float) and pd.isna(val): return None
+                    if isinstance(val, str) and val.strip() == "": return None
+                    if cast == "int":   return int(float(val))
+                    if cast == "float": return float(val)
+                    if cast == "date":  return pd.Timestamp(val).date()
+                    return str(val)[:512]
+                except Exception:
                     return None
-                if cast == "int":
-                    try: return int(float(val))
-                    except: return None
-                if cast == "float":
-                    try: return float(val)
-                    except: return None
-                if cast == "date":
-                    try: return pd.Timestamp(val).date()
-                    except: return None
-                return str(val)[:512] if val is not None else None
 
             records = []
             for _, row in to_insert.iterrows():
@@ -565,26 +563,38 @@ class DataStore:
                     _safe(row.get("direct_roi7"), "float"),
                 ))
 
-            insert_sql = """
-                INSERT INTO campaign_data (
-                    file_type, row_hash, date, campaign_id, campaign, status,
+            # Use VALUES (...),(...) bulk insert — much faster than executemany
+            # and works reliably on both CockroachDB and PostgreSQL
+            insert_cols = """(file_type, row_hash, date, campaign_id, campaign, status,
                     keyword, city, placement, product, search_query, brand,
                     start_date, match_type, bidding, phase,
                     spend, revenue, clicks, impressions, orders, budget,
-                    a2c, ecpm, ecpc, direct_gmv7, direct_roi7
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (file_type, row_hash) DO NOTHING;
-            """
-            # Batch insert in chunks of 500 (works on both Neon and CockroachDB)
-            BATCH = 500
+                    a2c, ecpm, ecpc, direct_gmv7, direct_roi7)"""
+
+            BATCH = 200  # smaller batch = more reliable on CockroachDB
+            total_committed = 0
             for i in range(0, len(records), BATCH):
-                cur.executemany(insert_sql, records[i:i+BATCH])
-            conn.commit()
+                batch = records[i:i+BATCH]
+                # Build VALUES clause manually — safe because all values go
+                # through psycopg2 parameter binding per row
+                placeholders = ",".join(
+                    cur.mogrify("(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", r).decode()
+                    for r in batch
+                )
+                cur.execute(
+                    f"INSERT INTO campaign_data {insert_cols} VALUES {placeholders} "
+                    f"ON CONFLICT (file_type, row_hash) DO NOTHING;"
+                )
+                conn.commit()
+                total_committed += len(batch)
+
             return added, skipped
 
         except Exception as e:
             conn.rollback()
-            st.warning(f"DB insert warning: {e} — falling back to session state")
+            # Show full error — don't hide it silently
+            st.error(f"❌ Database insert failed: {e}")
+            # Fall back to session state so data is still usable this session
             return cls._upsert_ss(ftype, new_df,
                                   [c for c in DEDUP_KEYS.get(ftype, ["campaign"])
                                    if c in new_df.columns])
@@ -1289,18 +1299,8 @@ FREQUENCY_CONFIG = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    # ── Detect DB URL change and bust cache if needed ────────────────────────
-    # This handles the case where DATABASE_URL is updated in secrets while
-    # @st.cache_resource still holds an old connection pool.
+    # ── DB URL change detection (runs once per session, no rerun) ─────────────
     _db_url_changed()
-
-    # ── Header ──────────────────────────────────────────────────────────────
-    st.markdown("""
-    <div class="dash-header">
-      <h1>📊 Campaign Intelligence Dashboard</h1>
-      <p>Upload your Instamart / Swiggy Ads CSV exports to unlock deep performance insights</p>
-    </div>
-    """, unsafe_allow_html=True)
 
     # ── Sidebar ──────────────────────────────────────────────────────────────
     with st.sidebar:
@@ -1478,6 +1478,14 @@ def main():
                 custom_start = st.date_input("From")
                 custom_end   = st.date_input("To")
 
+    # ── Header (rendered after sidebar so sidebar vars are available) ─────────
+    st.markdown("""
+    <div class="dash-header">
+      <h1>📊 Campaign Intelligence Dashboard</h1>
+      <p>Upload your Instamart / Swiggy Ads CSV exports to unlock deep performance insights</p>
+    </div>
+    """, unsafe_allow_html=True)
+
     # ── Collect all uploaded files ────────────────────────────────────────────
     uploaded_pairs: list[tuple] = []
     for key, fobj in slot_files.items():
@@ -1525,7 +1533,8 @@ def main():
                         )
 
         # ── Rerun after inserting new rows so dashboard loads fresh ───────────
-        if newly_added > 0:
+        # Only rerun if DB insert succeeded (data is in DB, not just session state)
+        if newly_added > 0 and DataStore._db_ok():
             st.rerun()
 
     # ── Show onboarding if DB still empty and nothing uploaded ────────────────
