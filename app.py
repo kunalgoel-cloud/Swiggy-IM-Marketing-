@@ -15,7 +15,6 @@ import io
 import hashlib
 import json
 import psycopg2
-from psycopg2.extras import execute_values
 from psycopg2 import pool as pg_pool
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -158,12 +157,20 @@ DIM_COLS = [
 
 @st.cache_resource(show_spinner=False)
 def _get_db_pool():
-    """Create a connection pool (cached across sessions via @cache_resource)."""
+    """Create a connection pool (cached across sessions via @cache_resource).
+    Compatible with both Neon PostgreSQL (sslmode=require) and
+    CockroachDB (sslmode=verify-full).
+    """
     try:
         conn_str = st.secrets.get("DATABASE_URL", "")
         if not conn_str:
             return None
-        p = pg_pool.SimpleConnectionPool(1, 5, conn_str)
+        # CockroachDB needs application_name set and prefers keepalives
+        p = pg_pool.SimpleConnectionPool(
+            1, 5, conn_str,
+            application_name="campaign_dashboard",
+            connect_timeout=10,
+        )
         return p
     except Exception as e:
         st.warning(f"⚠️ DB pool init failed: {e}")
@@ -190,13 +197,14 @@ def _release(conn):
 
 
 def _init_schema():
-    """Create tables if they don't exist. Called once at startup."""
+    """Create tables and indexes. Compatible with both PostgreSQL (Neon) and CockroachDB."""
     conn = _get_conn()
     if conn is None:
         return
     try:
         cur = conn.cursor()
         # Main data table — one row per granular record
+        # BIGSERIAL works on both Neon PostgreSQL and CockroachDB
         cur.execute("""
             CREATE TABLE IF NOT EXISTS campaign_data (
                 id              BIGSERIAL PRIMARY KEY,
@@ -216,27 +224,32 @@ def _init_schema():
                 match_type      TEXT,
                 bidding         TEXT,
                 phase           TEXT,
-                spend           NUMERIC(14,4),
-                revenue         NUMERIC(14,4),
+                spend           DECIMAL(14,4),
+                revenue         DECIMAL(14,4),
                 clicks          BIGINT,
                 impressions     BIGINT,
                 orders          BIGINT,
-                budget          NUMERIC(14,4),
+                budget          DECIMAL(14,4),
                 a2c             BIGINT,
-                ecpm            NUMERIC(10,4),
-                ecpc            NUMERIC(10,4),
-                direct_gmv7     NUMERIC(14,4),
-                direct_roi7     NUMERIC(10,4),
-                uploaded_at     TIMESTAMPTZ DEFAULT NOW()
+                ecpm            DECIMAL(10,4),
+                ecpc            DECIMAL(10,4),
+                direct_gmv7     DECIMAL(14,4),
+                direct_roi7     DECIMAL(10,4),
+                uploaded_at     TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE (file_type, row_hash)
             );
         """)
-        # Index for fast date-range queries
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_cd_date      ON campaign_data(date);
-            CREATE INDEX IF NOT EXISTS idx_cd_filetype  ON campaign_data(file_type);
-            CREATE INDEX IF NOT EXISTS idx_cd_row_hash  ON campaign_data(row_hash);
-        """)
         conn.commit()
+        # CockroachDB requires separate statements per CREATE INDEX
+        for idx_sql in [
+            "CREATE INDEX IF NOT EXISTS idx_cd_date     ON campaign_data (date);",
+            "CREATE INDEX IF NOT EXISTS idx_cd_filetype ON campaign_data (file_type);",
+        ]:
+            try:
+                cur.execute(idx_sql)
+                conn.commit()
+            except Exception:
+                conn.rollback()   # index may already exist — safe to ignore
     except Exception as e:
         conn.rollback()
         st.warning(f"Schema init warning: {e}")
@@ -501,10 +514,13 @@ class DataStore:
                     start_date, match_type, bidding, phase,
                     spend, revenue, clicks, impressions, orders, budget,
                     a2c, ecpm, ecpc, direct_gmv7, direct_roi7
-                ) VALUES %s
-                ON CONFLICT DO NOTHING;
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (file_type, row_hash) DO NOTHING;
             """
-            execute_values(cur, insert_sql, records, page_size=500)
+            # Batch insert in chunks of 500 (works on both Neon and CockroachDB)
+            BATCH = 500
+            for i in range(0, len(records), BATCH):
+                cur.executemany(insert_sql, records[i:i+BATCH])
             conn.commit()
             return added, skipped
 
